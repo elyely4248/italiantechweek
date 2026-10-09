@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+!.env.example
+
+# Migration inputs and generated audit exports are not runtime assets.
+legacy/export/
+legacy/export.zip
+normalized_export/*.csv

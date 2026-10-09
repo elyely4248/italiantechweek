@@ -1,0 +1,357 @@
+  Full Technical Analysis & Recommendations
+
+  1. What This Is
+
+  A 5-hour hackathon to build a HubSpot-compatible CRM from scratch that:
+  - Exposes a HubSpot-compatible REST API (contacts, companies, deals, tickets, products, line items, activities,
+  associations, properties, pipelines, search, lists, import/export)
+  - Migrates ~675K rows from a legacy Sinergia CRM (9 CSV files)
+  - Implements 13 business requirements (R1-R13)
+  - Includes an AI chat assistant (R13) using gpt-6-luna via OpenRouter
+  - Deploys on Railway (EU West)
+  - Survives durability tests (restart, concurrent writes, pagination at volume)
+
+  Scoring: 50pts data/rules (R1-R12), 30pts assistant (R13), 10pts HubSpot API conformity, 10pts durability.
+
+  ---
+  2. Critical Data Quality Issues Discovered
+
+  A. CSV Parsing: Semicolons Inside Quoted Fields
+
+  aziende.csv has 3,464 rows with extra fields (2,564 with 9 columns, 900 with 10) because the note field contains
+  semicolons inside quotes. A naive split on ; will misalign columns. You MUST use a proper CSV parser (e.g., Python csv
+   module, papaparse in JS) that handles RFC 4180 quoting. Same issue affects attivita.csv (the testo field contains
+  newlines and semicolons inside quotes) and opportunita.csv (the contatti field uses semicolons: "4675114;9275880").
+
+  B. Partita IVA Hidden in Notes
+
+  VAT numbers are not in a dedicated column — they're buried in the note field of aziende.csv in at least 6 formats:
+  - partita iva 84874 281912 (spaces in the number)
+  - P.IVA 67105837370
+  - P. IVA: IT 40969350707 (with IT prefix)
+  - p.iva IT11476373136
+  - P.IVA 96517251268 - cliente storico
+  - partita iva 11411 890210
+
+  Extraction strategy: Regex like /p\.?\s*iva[:\s]*(?:IT\s*)?(\d[\d\s]+)/i, then strip spaces, validate exactly 11
+  digits. This is a Choice Sheet discovery — the requests say partita_iva exists but don't say where to find it.
+
+  C. Amount Parsing (12+ Formats)
+
+  The importo field in opportunita.csv is a nightmare:
+
+
+
+
+
+
+
+  ┌──────────────────────┬────────────────┬────────────────────────┐
+  │        Format        │    Example     │         Value          │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ Italian decimal      │ 488210,35      │ 488210.35              │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ Currency prefix      │ € -5.131,24    │ -5131.24               │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ English decimal      │ € 1027956.14   │ 1027956.14             │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ English thousands    │ €24,376.08     │ 24376.08               │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ Parentheses negative │ (21.218,84)    │ -21218.84              │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ Trailing minus       │ 3216,65-       │ -3216.65               │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ Words                │ 1,5 Mln        │ 1500000                │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ Words                │ 588.12 mensili │ 588.12 (annual = ×12?) │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ No currency          │ 380595,19      │ 380595.19              │
+  ├──────────────────────┼────────────────┼────────────────────────┤
+  │ EUR prefix           │ EUR 223.370,86 │ 223370.86              │
+  └──────────────────────┴────────────────┴────────────────────────┘
+
+  Key ambiguity: Is 1.151,12 Italian (1151.12) or 24,376.08 English (24376.08)? You need heuristics: if both . and ,
+  appear, the last separator is the decimal. If only , and 2 decimal places follow, it's the decimal separator. "1,5
+  Mln" is a special case (multiply by 1,000,000).
+
+  D. Currency Normalization
+
+  Values found in valuta column and embedded in importo:
+  - EUR: EUR, eur, €, Euro
+  - USD: USD, usd, $
+  - GBP: GBP, gbp, £
+  - Empty / missing → EUR (per R3)
+
+  But some rows have currency in the importo field itself (e.g., € -5.131,24) and a different value in valuta (e.g., €).
+   Parse currency from both, prioritize valuta column when it's explicit (EUR/USD/GBP).
+
+  E. Date Formats (5+ Formats)
+
+  - DD/MM/YYYY HH:MM:SS — 18/01/2015
+  - YYYY-MM-DD — 2018-05-17
+  - DD-MM-YYYY — 20-04-2017
+  - DD.MM.YY — 04.09.18
+  - Excel serial number — 42466 (= 2016-04-07)
+  - DD/MM/YYYY HH:MM:SS — 16/03/2014 00:00:00
+  - 19/9/2015 (single-digit month)
+
+  F. Pipeline & Stage Normalization
+
+  Pipeline: VENDITE, Vendite, vendite  (trailing space), RINNOVI, Rinnovi, rinnovi , empty → Vendite (default).
+
+  Vendite stages — must strip prefix and normalize case:
+
+
+
+
+  ┌─────────────────────────────────────────────────────────┬───────────────────────┐
+  │                       Raw values                        │       Mapped to       │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 01, 01 - Contatto, 01 CONTATTO, Contatto,  contatto     │ appointmentscheduled  │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 02, 02 - Qualifica, 02 QUALIFICA, Qualifica,  qualifica │ qualifiedtobuy        │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 03, ... Presentazione,  presentazione                   │ presentationscheduled │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 04, ... Decisione,  decisione                           │ decisionmakerboughtin │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 05, ... Contratto,  contratto                           │ contractsent          │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 06, ... Vinta,  vinta, 06 - Vinta, 06 VINTA             │ closedwon             │
+  ├─────────────────────────────────────────────────────────┼───────────────────────┤
+  │ 07, ... Persa,  persa, 07 - Persa, 07 PERSA             │ closedlost            │
+  └─────────────────────────────────────────────────────────┴───────────────────────┘
+
+  Rinnovi stages:
+
+  ┌──────────────────────────────────────────────────────────┬───────────────┐
+  │                        Raw values                        │   Mapped to   │
+  ├──────────────────────────────────────────────────────────┼───────────────┤
+  │ R1, R1 - Da rinnovare, Da rinnovare, DA RINNOVARE, r1    │ da_rinnovare  │
+  ├──────────────────────────────────────────────────────────┼───────────────┤
+  │ R2, R2 - In trattativa, In trattativa, IN TRATTATIVA, r2 │ in_trattativa │
+  ├──────────────────────────────────────────────────────────┼───────────────┤
+  │ R3, R3 - Rinnovato, Rinnovato, RINNOVATO, r3             │ rinnovato     │
+  ├──────────────────────────────────────────────────────────┼───────────────┤
+  │ R4, R4 - Non rinnovato, Non rinnovato, NON RINNOVATO, r4 │ non_rinnovato │
+  └──────────────────────────────────────────────────────────┴───────────────┘
+
+  G. Cancellato / Attivo Boolean Chaos
+
+  Both fields use inconsistent representations:
+  - Deleted (skip): S, s, SI, Si
+  - Not deleted (keep): 0, N, n, NO, No, empty string
+  - DANGER: In aziende.csv, when CSV parsing fails, province codes (MI, VA, CO) appear in the cancellato column — proper
+   CSV parsing eliminates this.
+
+  H. Lifecyclestage Mapping
+
+  contatti.csv tipo field:
+
+  ┌────────────────────────────────────────────────┬────────────────────────┐
+  │                      Raw                       │ HubSpot lifecyclestage │
+  ├────────────────────────────────────────────────┼────────────────────────┤
+  │ Lead, LEAD, lead,  Lead                        │ lead                   │
+  ├────────────────────────────────────────────────┼────────────────────────┤
+  │ Prospect, PROSPECT, prospect                   │ opportunity            │
+  ├────────────────────────────────────────────────┼────────────────────────┤
+  │ Cliente, CLIENTE, cliente, Cliente             │ customer               │
+  ├────────────────────────────────────────────────┼────────────────────────┤
+  │ Ex cliente, EX CLIENTE, ex cliente, Ex-cliente │ other                  │
+  └────────────────────────────────────────────────┴────────────────────────┘
+
+  DANGER: ~45 rows show numeric IDs in tipo — this is column shifting from unquoted semicolons in earlier fields. Needs
+  careful CSV parsing.
+
+  I. Activity Type Mapping
+
+  attivita.csv tipo field:
+
+  ┌──────────────────────────────────────┬────────────────┐
+  │                 Raw                  │ HubSpot object │
+  ├──────────────────────────────────────┼────────────────┤
+  │ Nota, NOTA, nota, Appunto            │ notes          │
+  ├──────────────────────────────────────┼────────────────┤
+  │ Chiamata, CHIAMATA, Telefonata, Tel. │ calls          │
+  ├──────────────────────────────────────┼────────────────┤
+  │ Email, E-mail, email, Mail           │ emails         │
+  ├──────────────────────────────────────┼────────────────┤
+  │ Meeting, Incontro, Riunione, Visita  │ meetings       │
+  └──────────────────────────────────────┴────────────────┘
+
+  DANGER: ~30K rows have empty tipo with text content like "da valutare con la direzione." — these are likely multiline
+  testo values bleeding into subsequent rows. The CSV parser must handle quoted multiline content.
+
+  J. Domain Extraction (R1)
+
+  sito_web field has varied formats: www.example.it, http://www.example.it/, https://www.example.com/it/home,
+  example.it. Strip protocol, www., trailing path. Two companies with the same domain are duplicates and must be merged,
+   with extra domains going to hs_additional_domains.
+
+  K. Contact Deduplication by Email
+
+  Same email = same person. Email validation needed (discard invalid emails). Case-insensitive comparison. When merging,
+   take the most recently modified field values (per the general rule).
+
+  L. SKU Normalization (R4)
+
+  Product codes in listino.csv appear as both BF-12345 and BF12345 (missing hyphen). Normalize to BF-XXXXX format. Two
+  entries with same normalized SKU = same product, keep the one with the more recent ultima_modifica.
+
+  M. Line Item Quantity Parsing
+
+  righe_offerta.csv quantita field: 1 pz, 20, 100 — strip non-numeric suffixes.
+
+  N. User Reassignment (R3)
+
+  "Le trattative e i ticket li segue chi lavora oggi da noi: chi ha lasciato l'azienda non segue più niente." — Deals
+  and tickets assigned to inactive users (attivo = N/NO/n) must have their commerciale/assegnatario cleared.
+
+  ---
+  3. Architecture Recommendations
+
+  Tech Stack (for 5 hours)
+
+  - Runtime: Node.js/TypeScript or Python/FastAPI — both work. Python is slightly better for CSV parsing (pandas), Node
+  better for quick API scaffolding.
+  - Database: PostgreSQL (available on Railway). SQLite would be faster to set up but will fail durability and
+  concurrent-write tests. PostgreSQL with proper indexes will handle pagination and search at volume.
+  - Alternative: If using Node, consider better-sqlite3 with WAL mode — it handles concurrency decently and is simpler.
+  But PostgreSQL is safer for the "concurrent writes don't get lost" requirement.
+
+  Recommended approach:
+
+  1. PostgreSQL on Railway with a single service
+  2. Node.js + Express/Fastify or Python + FastAPI
+  3. Schema designed around HubSpot's object model (generic properties table, associations table)
+
+  Database Schema Strategy
+
+  HubSpot's API is property-based (objects have dynamic properties). Two approaches:
+
+  Option A — JSONB column (recommended for speed):
+  CREATE TABLE objects (
+    id BIGSERIAL PRIMARY KEY,
+    object_type TEXT NOT NULL, -- 'contacts', 'companies', 'deals', etc.
+    properties JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    archived BOOLEAN DEFAULT FALSE
+  );
+  CREATE INDEX idx_objects_type ON objects(object_type) WHERE NOT archived;
+  CREATE INDEX idx_objects_props ON objects USING GIN(properties);
+
+  Option B — EAV (Entity-Attribute-Value): More HubSpot-like but slower to query. Not recommended in a 5-hour window.
+
+  JSONB gives you flexible properties, GIN indexes for search, and simple queries. Add specific indexes for
+  high-frequency lookups:
+  CREATE UNIQUE INDEX idx_company_vat ON objects((properties->>'partita_iva'))
+    WHERE object_type='companies' AND properties->>'partita_iva' IS NOT NULL AND NOT archived;
+  CREATE UNIQUE INDEX idx_contact_email ON objects((properties->>'email'))
+    WHERE object_type='contacts' AND properties->>'email' IS NOT NULL AND NOT archived;
+
+  Associations Table
+
+  CREATE TABLE associations (
+    id BIGSERIAL PRIMARY KEY,
+    from_object_type TEXT NOT NULL,
+    from_object_id BIGINT NOT NULL,
+    to_object_type TEXT NOT NULL,
+    to_object_id BIGINT NOT NULL,
+    association_type_id INT NOT NULL,
+    UNIQUE(from_object_id, to_object_id, association_type_id)
+  );
+
+  ---
+  4. Priority Order (What to Build First)
+
+  Given the scoring breakdown (50 + 30 + 10 + 10 = 100):
+
+  Phase 1 (first 90 min) — Foundation + Migration:
+  1. API skeleton: /health, POST /__reset, auth middleware
+  2. Database schema + reset logic
+  3. CSV parser (handle Windows-1252, quoted semicolons, multiline)
+  4. POST /__migrate — download ZIP, parse all 9 CSVs, transform & load
+  5. R1 (companies) + R2 (contacts) + R3 (deals) — the core objects = 14pts
+  6. R12 (auto-associate contact to company by email domain) = 3pts
+
+  Phase 2 (next 60 min) — Remaining Data:
+  7. R4 (products + line items) = 4pts
+  8. R5 (tickets) = 4pts
+  9. R6 (activities → notes/calls/emails/meetings) = 4pts
+  10. R7 (partita IVA unique constraint + extraction from notes) = 4pts
+  11. R8 (fatturato_2025 + classe_cliente computation) = 6pts
+  12. R9 (dormant customers list) = 4pts
+
+  Phase 3 (next 60 min) — Automations + API Conformity:
+  13. R10 (deal won → ticket automation) = 4pts
+  14. R11 (deal lost → task automation) = 3pts
+  15. HubSpot API conformity: CRUD for all objects, search endpoint, pagination = 10pts
+
+  Phase 4 (next 60 min) — Assistant:
+  16. R13 (AI assistant) = 30pts — this is the biggest single item. Build tool-calling with search/read/write CRM
+  capabilities.
+
+  Phase 5 (last 30 min) — Durability + Polish:
+  17. Ensure data persists across restarts (it does with PostgreSQL)
+  18. Handle concurrent writes (PostgreSQL transactions + unique constraints)
+  19. Basic UI if time permits
+
+  ---
+  5. Migration-Specific Gotchas
+
+  1. 5-minute timeout — With 675K rows, bulk insert. Use COPY or batch INSERT ... VALUES (1000 rows at a time). Don't
+  insert one by one.
+  2. Deduplication during migration: Companies by domain, contacts by email, products by SKU — must merge, keeping the
+  most recent ultima_modifica per field, and the id_legacy of the most recently modified row.
+  3. R8 fatturato_2025: Revenue = sum of won deals (closedwon in Vendite, rinnovato in Rinnovi) with closedate in 2025,
+  associated to the company, MINUS "storno" deals (negative amounts that are also won in 2025). Convert USD (×0.92) and
+  GBP (×1.17). Round total to 2 decimals. Class: A ≥ 100000, B ≥ 20000, C > 0, empty if ≤ 0.
+  4. R9 dormant customers: Companies with ≥1 won deal (any year) AND zero activities in 2025. Activities come from
+  contacts' activities AND deals' activities (via associations).
+  5. R3 "rinnovi sono annuali": If a deal says "588.12 mensili" (monthly), the annual amount is ×12. This is another
+  Choice Sheet discovery.
+  6. Contatti field in opportunita.csv: Contact IDs separated by , or ; (inside quotes), sometimes with spaces:
+  "4675114;9275880", 3615919,5256299, "2096379 ; 9508018", 9399836,3835588,3188401. Split on both , and ;, trim spaces.
+
+  ---
+  6. HubSpot API Conformity Notes
+
+  The tests expect standard HubSpot API patterns:
+  - GET /crm/v3/objects/{objectType} — list with pagination (after cursor, limit)
+  - GET /crm/v3/objects/{objectType}/{id} — single record
+  - POST /crm/v3/objects/{objectType} — create
+  - PATCH /crm/v3/objects/{objectType}/{id} — update
+  - DELETE /crm/v3/objects/{objectType}/{id} — archive
+  - POST /crm/v3/objects/{objectType}/search — search with filters
+  - POST /crm/v3/objects/{objectType}/batch/create — batch operations
+  - Properties, pipelines, associations all have their own endpoints
+
+  Response format: {"id": "123", "properties": {...}, "createdAt": "...", "updatedAt": "...", "archived": false}
+
+  ---
+  7. Assistant (R13) Strategy
+
+  Worth 30 points — highest single item. Key design:
+
+  1. System prompt: Explain it's a Brambilla CRM assistant, reply in Italian, knows the user from context.user, respects
+   R7/R10/R11/R12 rules.
+  2. Tools for the LLM:
+    - search_crm(object_type, filters) — search contacts/companies/deals/tickets
+    - get_record(object_type, id) — read a specific record with associations
+    - update_record(object_type, id, properties) — modify a record
+    - create_record(object_type, properties) — create a record
+    - list_associations(object_type, id) — get associated records
+  3. "My customers": When the user says "i miei clienti", look up deals/tickets where commerciale/assegnatario =
+  context.user, then find the associated companies.
+  4. Safety: The assistant must refuse operations that violate R7 (duplicate partita IVA), and must trigger R10/R11/R12
+  when it modifies deals. It should confirm before making changes and only touch the records it mentions.
+  5. Budget: $10 total. Each tool-calling conversation might cost $0.05-0.20. With ~40 evaluation requests, that's $2-8.
+   Keep prompts concise.
+
+  ---
+  8. Key Risks
+
+  1. Migration timeout: 675K rows in 5 minutes. Pre-process in memory, bulk insert. On Railway's free tier, CPU can be
+  slow — test early.
+✻ Worked for 5m 11she quoted-semic
