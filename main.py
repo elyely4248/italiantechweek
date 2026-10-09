@@ -321,7 +321,7 @@ body{background:linear-gradient(180deg,#f7fafc 0,#eef4f8 100%);color:var(--ink);
 .table-wrap{border-radius:var(--radius);box-shadow:var(--shadow);background:var(--surface)}table{min-width:820px}th{position:sticky;top:0;z-index:1;background:#f3f8fb;color:#51677a;font-size:11px}td{color:#223847}tbody tr{transition:background .15s ease}tbody tr:hover{background:#f7fbfd}td a{font-weight:750}.badge{min-height:24px;border-radius:999px;padding:4px 10px;letter-spacing:0}.toolbar{align-items:flex-start}.tabs{gap:6px}.tab{border-radius:999px;font-weight:750}.tab:hover{text-decoration:none;border-color:#b8c9d6}.tab.active{background:#fff4ef}.btn{font-weight:750;box-shadow:var(--shadow-sm)}.btn:hover{text-decoration:none;border-color:#b8c9d6}
 .kv{grid-template-columns:minmax(110px,150px) minmax(0,1fr)}.kv dd{word-break:break-word}.list-item{border-color:#dbe7ee;background:#fff;transition:border-color .15s ease,box-shadow .15s ease}.list-item:hover{border-color:#b8c9d6;box-shadow:var(--shadow-sm)}.timeline{position:relative}.event{background:#fff;border:1px solid #dbe7ee;border-left:3px solid var(--teal);border-radius:7px;padding:10px 12px}.event strong{color:#1c394c}.event time{font-weight:700}
 .board{grid-auto-columns:minmax(280px,1fr);gap:16px}.column{background:#eef5f8;border-color:#d3e1ea;border-radius:var(--radius);box-shadow:var(--shadow-sm)}.column.closed-won{background:#eaf8f0;border-color:#c9ecd9}.column.closed-lost{background:#fff0ee;border-color:#f2c7c1}.col-h{background:rgba(255,255,255,.6);border-radius:var(--radius) var(--radius) 0 0;color:#263d50}.deal-card{border-radius:7px;border-color:#dbe7ee;box-shadow:0 1px 3px rgba(33,51,67,.05);transition:transform .15s ease,box-shadow .15s ease}.deal-card:hover{transform:translateY(-1px);box-shadow:var(--shadow-sm)}.deal-card .amount{font-size:15px}
-.chat-toggle{box-shadow:0 12px 26px rgba(255,122,89,.32);font-size:22px}.chat-panel{border-radius:10px;box-shadow:0 20px 46px rgba(25,39,51,.22)}.chat-header{background:linear-gradient(135deg,#253d52,#1c3347)}.chat-user-row select,.chat-input-row input{background:#fff}.chat-input-row input:disabled,.chat-send:disabled{background:#eef3f6}.chat-send{min-width:66px}.chat-msg{box-shadow:0 1px 2px rgba(33,51,67,.05)}
+.chat-toggle{box-shadow:0 12px 26px rgba(255,122,89,.32);font-size:22px}.chat-panel{border-radius:10px;box-shadow:0 20px 46px rgba(25,39,51,.22)}.chat-header{background:linear-gradient(135deg,#253d52,#1c3347)}.chat-user-row select,.chat-input-row input{background:#fff}.chat-input-row input:disabled,.chat-send:disabled{background:#eef3f6}.chat-send{min-width:66px}.chat-msg{box-shadow:0 1px 2px rgba(33,51,67,.05)}.deal-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.deal-reason{display:block;margin-top:6px;color:var(--muted);font-size:12px}.deal-card .deal-meta{margin-top:8px}
 @media (max-width:850px){.sidebar{width:100%;border-right:0}.brand{margin-bottom:10px}.nav{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:14px}.main{margin-left:0;width:100%}.topbar{position:static;align-items:flex-start;gap:12px}.topbar-meta{margin-left:0}.content{padding:18px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.table-wrap{border-radius:7px}.chat-toggle{right:18px;bottom:18px}}
 @media (max-width:560px){.nav{grid-template-columns:1fr}.stats{grid-template-columns:1fr}.topbar{display:block}.topbar-meta{margin-top:12px;flex-wrap:wrap}.content{padding:14px}.kv{grid-template-columns:1fr}.board{grid-auto-columns:88vw}.chat-toggle{width:52px;height:52px}.chat-panel{max-height:calc(100vh - 120px)}}
 """
@@ -357,11 +357,12 @@ def _first_prop(record: dict[str, Any] | None, names: tuple[str, ...], default: 
     return default
 
 
-def _money(value: Any) -> str:
+def _money(value: Any, currency: str = "EUR") -> str:
     number = _number(value)
     if number is None:
         return "-"
-    return f"EUR {number:,.0f}".replace(",", ".")
+    code = (currency or "EUR").upper()
+    return f"{code} {number:,.0f}".replace(",", ".")
 
 
 def _number(value: Any) -> float | None:
@@ -396,6 +397,46 @@ def _stage_badge(stage: str, label: str | None = None) -> str:
     lower = stage.lower()
     color = "green" if lower in {"closedwon", "rinnovato", "chiuso", "4"} else "red" if lower in {"closedlost", "non_rinnovato"} else "blue"
     return _badge(stage, color, label)
+
+
+def _deal_currency(deal: dict[str, Any]) -> str:
+    return (_prop(deal, "deal_currency_code", "EUR") or "EUR").upper()
+
+
+def _deal_amount(deal: dict[str, Any]) -> str:
+    return _money(_prop(deal, "amount"), _deal_currency(deal))
+
+
+def _deal_counts_2025_revenue(deal: dict[str, Any]) -> tuple[bool, str]:
+    pipeline = _prop(deal, "pipeline")
+    stage = _prop(deal, "dealstage")
+    closedate = _prop(deal, "closedate")
+    is_won = (pipeline == "default" and stage == "closedwon") or (pipeline == "rinnovi" and stage == "rinnovato")
+    if not is_won:
+        return False, "Esclusa: fase non chiusa/vinta"
+    if not closedate:
+        return False, "Esclusa: data chiusura mancante"
+    if not closedate.startswith("2025"):
+        return False, f"Esclusa: chiusa il {_date_short(closedate)}"
+    return True, "Inclusa nel fatturato 2025"
+
+
+def _deal_revenue_badge(deal: dict[str, Any]) -> str:
+    included, reason = _deal_counts_2025_revenue(deal)
+    color = "green" if included else "gray"
+    label = "Conta nel 2025" if included else "Non conta nel 2025"
+    return f"{_badge(label, color)}<span class='deal-reason'>{_h(reason)}</span>"
+
+
+def _stage_total_label(deals: list[dict[str, Any]]) -> str:
+    currencies = {_deal_currency(deal) for deal in deals if _number(_prop(deal, "amount")) is not None}
+    if not deals:
+        return "-"
+    if len(currencies) == 1:
+        currency = next(iter(currencies), "EUR")
+        total = sum(_number(_prop(deal, "amount")) or 0 for deal in deals)
+        return _money(total, currency)
+    return "multi-valuta"
 
 
 def _layout(title: str, active: str, body: str, subtitle: str = "") -> str:
@@ -667,7 +708,7 @@ async def _render_company_detail(company_id: int) -> str:
         f"<dt>Partita IVA</dt><dd>{_h(props.get('partita_iva', '-'))}</dd>"
         f"<dt>Citta</dt><dd>{_h(props.get('city', '-'))}</dd>"
         f"<dt>Provincia</dt><dd>{_h(props.get('state', '-'))}</dd>"
-        f"<dt>Fatturato 2025</dt><dd>{_money(props.get('fatturato_2025'))}</dd>"
+        f"<dt>Fatturato 2025 (EUR)</dt><dd>{_money(props.get('fatturato_2025'))}</dd>"
         f"<dt>Classe</dt><dd>{_class_badge(props.get('classe_cliente'))}</dd>"
         "</dl></div></div>"
     )
@@ -693,7 +734,13 @@ async def _render_company_detail(company_id: int) -> str:
     ) or "<div class='empty'>Nessun contatto associato.</div>"
     deal_items = "".join(
         f"<div class='list-item'><div class='item-title'>{_h(_prop(d,'dealname','Trattativa'))}</div>"
-        f"<div>{_money(_prop(d,'amount'))}</div>{_stage_badge(_prop(d,'dealstage'))}</div>"
+        f"<div>{_deal_amount(d)}</div>"
+        "<div class='deal-meta'>"
+        f"{_stage_badge(_prop(d,'dealstage'))}"
+        f"{_badge(_prop(d,'pipeline','-'), 'blue')}"
+        f"{_badge(_date_short(_prop(d,'closedate')), 'gray', 'Chiusura: ' + _date_short(_prop(d,'closedate')))}"
+        "</div>"
+        f"<div class='deal-meta'>{_deal_revenue_badge(d)}</div></div>"
         for d in deals
     ) or "<div class='empty'>Nessuna trattativa associata.</div>"
     ticket_items = "".join(
@@ -708,7 +755,7 @@ async def _render_company_detail(company_id: int) -> str:
     )
     stats = (
         "<div class='stats'>"
-        f"<div class='stat'><div class='k'>Fatturato 2025</div><div class='v'>{_money(props.get('fatturato_2025'))}</div></div>"
+        f"<div class='stat'><div class='k'>Fatturato 2025 (EUR)</div><div class='v'>{_money(props.get('fatturato_2025'))}</div></div>"
         f"<div class='stat'><div class='k'>Contatti</div><div class='v'>{len(contacts)}</div></div>"
         f"<div class='stat'><div class='k'>Trattative</div><div class='v'>{len(deals)}</div></div>"
         "</div>"
@@ -749,7 +796,7 @@ async def _render_deals_page(pipeline: str | None = None) -> str:
     columns = []
     for stage in order:
         stage_deals = grouped.get(stage, [])
-        total = sum(_number(_prop(deal, "amount")) or 0 for deal in stage_deals)
+        total_label = _stage_total_label(stage_deals)
         cards = []
         for deal in stage_deals:
             deal_id = int(deal.get("id", 0))
@@ -757,7 +804,8 @@ async def _render_deals_page(pipeline: str | None = None) -> str:
             cards.append(
                 "<div class='deal-card'>"
                 f"<div class='item-title'>{_h(_prop(deal,'dealname','Trattativa'))}</div>"
-                f"<div class='amount'>{_money(_prop(deal,'amount'))}</div>"
+                f"<div class='amount'>{_deal_amount(deal)}</div>"
+                f"<div class='deal-meta'>{_badge(_date_short(_prop(deal,'closedate')), 'gray', 'Chiusura: ' + _date_short(_prop(deal,'closedate')))}</div>"
                 f"<div class='muted'>{_h(company_name)}</div>"
                 f"<div class='muted'>{_h(_prop(deal,'commerciale',''))}</div>"
                 "</div>"
@@ -765,7 +813,7 @@ async def _render_deals_page(pipeline: str | None = None) -> str:
         closed_class = " closed-won" if stage in {"closedwon", "rinnovato"} else " closed-lost" if stage in {"closedlost", "non_rinnovato"} else ""
         columns.append(
             f"<section class='column{closed_class}'><div class='col-h'>{_h(labels.get(stage, stage))}"
-            f"<div class='col-meta'>{len(stage_deals)} trattative &middot; {_money(total)}</div></div>"
+            f"<div class='col-meta'>{len(stage_deals)} trattative &middot; {total_label}</div></div>"
             f"{''.join(cards) if cards else '<div class=\"empty\">Vuoto</div>'}</section>"
         )
     board = "".join(columns) if columns else "<div class='table-wrap'><div class='empty'>Nessuna fase disponibile.</div></div>"
