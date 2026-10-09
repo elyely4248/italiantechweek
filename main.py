@@ -1,3 +1,4 @@
+import asyncio
 import contextvars
 import html
 import importlib
@@ -460,6 +461,8 @@ WON_DEAL_STAGES = {"closedwon", "rinnovato"}
 LOST_DEAL_STAGES = {"closedlost", "non_rinnovato"}
 CLOSED_TICKET_STAGES = {"chiuso", "closed", "closedwon", "closedlost", "resolved"}
 PRIORITY_SCORE = {"URGENT": 34, "HIGH": 24, "MEDIUM": 12, "LOW": 4}
+SMART_POOL_LIMIT = 120
+SMART_DISPLAY_LIMIT = 10
 
 
 def _parse_day(value: Any):
@@ -921,6 +924,75 @@ async def _all_search_results(object_type: str, filter_groups: list[dict[str, An
         after = int(next_after)
 
 
+async def _search_page(
+    object_type: str,
+    filter_groups: list[dict[str, Any]] | None = None,
+    *,
+    limit: int = SMART_POOL_LIMIT,
+    sorts: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    page = await _call_db(
+        "search_objects",
+        object_type,
+        filter_groups or [],
+        sorts=sorts or [{"propertyName": "lastmodifieddate", "direction": "DESCENDING"}],
+        limit=min(max(1, limit), 200),
+        after=0,
+    )
+    return page.get("results", [])
+
+
+def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for record in records:
+        record_id = str(record.get("id", ""))
+        if record_id:
+            deduped.setdefault(record_id, record)
+    return list(deduped.values())
+
+
+async def _smart_candidates(
+    object_type: str,
+    *,
+    viewer_email: str = "",
+    owner_field: str = "",
+) -> list[dict[str, Any]]:
+    recent_sort = [{"propertyName": "lastmodifieddate", "direction": "DESCENDING"}]
+    tasks = [_search_page(object_type, [], limit=SMART_POOL_LIMIT, sorts=recent_sort)]
+    if viewer_email and owner_field:
+        tasks.append(
+            _search_page(
+                object_type,
+                [{"filters": [{"propertyName": owner_field, "operator": "EQ", "value": viewer_email}]}],
+                limit=SMART_POOL_LIMIT,
+                sorts=recent_sort,
+            )
+        )
+    if object_type == "deals":
+        tasks.append(
+            _search_page(
+                "deals",
+                [{"filters": [{"propertyName": "dealstage", "operator": "EQ", "value": stage}]} for stage in OPEN_DEAL_STAGES],
+                limit=SMART_POOL_LIMIT,
+                sorts=[{"propertyName": "closedate", "direction": "ASCENDING"}],
+            )
+        )
+    elif object_type == "tickets":
+        tasks.append(
+            _search_page(
+                "tickets",
+                [
+                    {"filters": [{"propertyName": "hs_ticket_priority", "operator": "EQ", "value": priority}]}
+                    for priority in ("URGENT", "HIGH")
+                ],
+                limit=SMART_POOL_LIMIT,
+                sorts=[{"propertyName": "createdate", "direction": "ASCENDING"}],
+            )
+        )
+    pages = await asyncio.gather(*tasks)
+    return _dedupe_records([record for page in pages for record in page])
+
+
 async def _get_many(object_type: str, ids: list[int]) -> list[dict[str, Any]]:
     records = []
     for object_id in ids:
@@ -941,9 +1013,11 @@ async def _company_name_for(object_type: str, object_id: int) -> str:
 
 
 async def _active_users() -> list[dict[str, Any]]:
-    return await _all_search_results(
+    return await _search_page(
         "users",
         [{"filters": [{"propertyName": "active", "operator": "EQ", "value": "true"}]}],
+        limit=200,
+        sorts=[{"propertyName": "lastname", "direction": "ASCENDING"}],
     )
 
 
@@ -965,7 +1039,11 @@ def _smart_section(title: str, count: int, items: str) -> str:
 
 async def _render_smart_page(user: str | None = None) -> str:
     viewer_email = str(user or "").strip().lower()
-    users = await _active_users()
+    users, deals, tickets = await asyncio.gather(
+        _active_users(),
+        _smart_candidates("deals", viewer_email=viewer_email, owner_field="commerciale"),
+        _smart_candidates("tickets", viewer_email=viewer_email, owner_field="assegnatario"),
+    )
     user_options = ["<option value=''>Vista generale</option>"]
     known_user = not viewer_email
     for item in users:
@@ -978,8 +1056,6 @@ async def _render_smart_page(user: str | None = None) -> str:
     if viewer_email and not known_user:
         user_options.append(f"<option value='{_h(viewer_email)}' selected>{_h(viewer_email)}</option>")
 
-    deals = await _all_search_results("deals", [])
-    tickets = await _all_search_results("tickets", [])
     scored_deals = sorted(
         ((score, deal, reasons) for deal in deals for score, reasons in [_score_deal(deal, viewer_email)]),
         key=lambda item: item[0],
@@ -992,26 +1068,63 @@ async def _render_smart_page(user: str | None = None) -> str:
     )
 
     company_context: dict[int, dict[str, Any]] = {}
+    company_names: dict[tuple[str, int], str] = {}
 
-    async def add_company_context(source_type: str, source_id: int, source_score: int, kind: str, viewer_match: bool) -> str:
+    async def resolve_company_context(
+        source_type: str,
+        source_id: int,
+        source_score: int,
+        kind: str,
+        viewer_match: bool,
+    ) -> tuple[str, int, str, dict[str, Any] | None, int, str, bool]:
         companies = await _associated_records(source_type, source_id, "companies")
         if not companies:
-            return "-"
+            return source_type, source_id, "-", None, source_score, kind, viewer_match
         company = companies[0]
+        return source_type, source_id, _prop(company, "name", f"Azienda {company.get('id', '')}"), company, source_score, kind, viewer_match
+
+    top_deals = scored_deals[:SMART_DISPLAY_LIMIT]
+    top_tickets = scored_tickets[:SMART_DISPLAY_LIMIT]
+    company_results = await asyncio.gather(
+        *(
+            resolve_company_context(
+                "deals",
+                int(deal.get("id", 0)),
+                score,
+                "deal",
+                bool(viewer_email and _prop(deal, "commerciale").lower() == viewer_email),
+            )
+            for score, deal, _ in top_deals
+        ),
+        *(
+            resolve_company_context(
+                "tickets",
+                int(ticket.get("id", 0)),
+                score,
+                "ticket",
+                bool(viewer_email and _prop(ticket, "assegnatario").lower() == viewer_email),
+            )
+            for score, ticket, _ in top_tickets
+        ),
+    )
+    for source_type, source_id, company_name, company, source_score, kind, viewer_match in company_results:
+        company_names[(source_type, source_id)] = company_name
+        if not company:
+            continue
         company_id = int(company.get("id", 0))
+        if not company_id:
+            continue
         entry = company_context.setdefault(
             company_id,
             {"company": company, "deal_scores": [], "ticket_scores": [], "viewer_match": False},
         )
         entry["viewer_match"] = bool(entry["viewer_match"] or viewer_match)
         entry[f"{kind}_scores"].append(source_score)
-        return _prop(company, "name", f"Azienda {company_id}")
 
     deal_items = []
-    for score, deal, reasons in scored_deals[:10]:
+    for score, deal, reasons in top_deals:
         deal_id = int(deal.get("id", 0))
-        owner_match = bool(viewer_email and _prop(deal, "commerciale").lower() == viewer_email)
-        company_name = await add_company_context("deals", deal_id, score, "deal", owner_match)
+        company_name = company_names.get(("deals", deal_id), "-")
         deal_items.append(
             "<div class='smart-item'>"
             f"<div class='toolbar'><div><div class='item-title'>{_h(_prop(deal, 'dealname', 'Trattativa'))}</div>"
@@ -1023,10 +1136,9 @@ async def _render_smart_page(user: str | None = None) -> str:
         )
 
     ticket_items = []
-    for score, ticket, reasons in scored_tickets[:10]:
+    for score, ticket, reasons in top_tickets:
         ticket_id = int(ticket.get("id", 0))
-        assignee_match = bool(viewer_email and _prop(ticket, "assegnatario").lower() == viewer_email)
-        company_name = await add_company_context("tickets", ticket_id, score, "ticket", assignee_match)
+        company_name = company_names.get(("tickets", ticket_id), "-")
         ticket_items.append(
             "<div class='smart-item'>"
             f"<div class='toolbar'><div><div class='item-title'>{_h(_prop(ticket, 'subject', 'Ticket'))}</div>"
@@ -1065,7 +1177,7 @@ async def _render_smart_page(user: str | None = None) -> str:
         f"<div class='deal-meta'>{_class_badge(_prop(company, 'classe_cliente'))}{_badge(_money(_prop(company, 'fatturato_2025')), 'green', 'Fatturato 2025: ' + _money(_prop(company, 'fatturato_2025')))}</div>"
         f"{_smart_reasons(reasons)}"
         "</div>"
-        for score, company_id, company, reasons in scored_companies[:10]
+        for score, company_id, company, reasons in scored_companies[:SMART_DISPLAY_LIMIT]
     )
 
     viewer_label = viewer_email or "vista generale"
@@ -1078,15 +1190,15 @@ async def _render_smart_page(user: str | None = None) -> str:
     stats = (
         "<div class='stats'>"
         f"<div class='stat'><div class='k'>Viewer</div><div class='v'>{_h(viewer_label)}</div></div>"
-        f"<div class='stat'><div class='k'>Trattative analizzate</div><div class='v'>{len(deals)}</div></div>"
-        f"<div class='stat'><div class='k'>Ticket analizzati</div><div class='v'>{len(tickets)}</div></div>"
+        f"<div class='stat'><div class='k'>Trattative candidate</div><div class='v'>{len(deals)}</div></div>"
+        f"<div class='stat'><div class='k'>Ticket candidati</div><div class='v'>{len(tickets)}</div></div>"
         "</div>"
     )
     grid = (
         "<div class='smart-grid'>"
         f"{_smart_section('Trattative da guardare', len(deal_items), ''.join(deal_items))}"
         f"{_smart_section('Ticket prioritari', len(ticket_items), ''.join(ticket_items))}"
-        f"{_smart_section('Aziende nel radar', len(scored_companies[:10]), company_items)}"
+        f"{_smart_section('Aziende nel radar', len(scored_companies[:SMART_DISPLAY_LIMIT]), company_items)}"
         "</div>"
     )
     body = controls + stats + grid
