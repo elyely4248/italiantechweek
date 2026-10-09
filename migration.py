@@ -565,6 +565,7 @@ async def _migrate_files(files: dict[str, Path]) -> None:
     for activity_type in body_properties:
         await flush(activity_type)
 
+    await _db().infer_contact_company_associations()
     await _calculate_revenue()
     await _create_dormant_list()
 

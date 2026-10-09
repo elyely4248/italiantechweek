@@ -26,6 +26,7 @@ OBJECT_TYPES = (
     "emails",
     "meetings",
     "tasks",
+    "quotes",
 )
 
 DEFAULT_PROPERTIES: dict[str, tuple[str, ...]] = {
@@ -40,6 +41,7 @@ DEFAULT_PROPERTIES: dict[str, tuple[str, ...]] = {
     "emails": ("hs_timestamp", "hs_email_text"),
     "meetings": ("hs_timestamp", "hs_meeting_body"),
     "tasks": ("hs_task_subject", "hs_timestamp", "hs_task_status"),
+    "quotes": ("hs_title", "hs_status", "hs_expiration_date", "hs_public_url_key", "amount"),
 }
 
 DEFAULT_PIPELINES = (
@@ -134,11 +136,11 @@ def _decode_json(value: Any, default: Any) -> Any:
 
 
 def _record_to_object(record: asyncpg.Record, properties: Sequence[str] | None = None) -> dict[str, Any]:
-    values = _normalize_properties(_decode_json(record["properties"], {}))
+    values: dict[str, Any] = _normalize_properties(_decode_json(record["properties"], {}))
     if properties is not None:
-        requested = set(properties)
-        requested.update(("hs_object_id", "createdate", "lastmodifieddate"))
-        values = {key: value for key, value in values.items() if key in requested}
+        requested = dict.fromkeys(properties)
+        requested.update(dict.fromkeys(("hs_object_id", "createdate", "lastmodifieddate")))
+        values = {key: values.get(key) for key in requested}
     return {
         "id": str(record["id"]),
         "properties": values,
@@ -340,14 +342,16 @@ async def get_object(
     object_type: str,
     object_id: int,
     properties: Sequence[str] | None = None,
+    archived: bool = False,
     *,
     conn: asyncpg.Connection | None = None,
 ) -> dict[str, Any] | None:
     async with _connection(conn) as active:
         record = await active.fetchrow(
-            "SELECT * FROM objects WHERE object_type=$1 AND id=$2 AND NOT archived",
+            "SELECT * FROM objects WHERE object_type=$1 AND id=$2 AND archived=$3",
             object_type,
             int(object_id),
+            bool(archived),
         )
     return _record_to_object(record, properties) if record else None
 
@@ -459,8 +463,11 @@ def _filter_sql(item: dict[str, Any], params: list[Any]) -> str:
     if operator == "NEQ":
         return f"lower(COALESCE({expression},'')) <> lower({value_ref}::text)"
     if operator == "CONTAINS_TOKEN":
-        params[-1] = f"%{_string_value(value)}%"
-        return f"COALESCE({expression},'') ILIKE {value_ref}"
+        return (
+            "EXISTS (SELECT 1 FROM regexp_split_to_table("
+            f"COALESCE({expression},''), '[;,\\s]+') AS token "
+            f"WHERE lower(token) = lower({value_ref}::text))"
+        )
     if operator in {"LT", "LTE", "GT", "GTE"}:
         comparison = {"LT": "<", "LTE": "<=", "GT": ">", "GTE": ">="}[operator]
         numeric = (
@@ -519,7 +526,7 @@ async def search_objects(
     has_more = len(records) > limit
     page = records[:limit]
     response: dict[str, Any] = {
-        "total": int(total),
+        "total": min(int(total), 10_000),
         "results": [_record_to_object(row, properties) for row in page],
     }
     if has_more:
@@ -673,6 +680,122 @@ async def bulk_insert_associations(
             """,
             values,
         )
+
+
+_INFER_CONTACT_COMPANY_CANDIDATES_SQL = """
+WITH edges AS (
+    SELECT from_object_type AS src_type,
+           from_object_id AS src_id,
+           to_object_type AS dst_type,
+           to_object_id AS dst_id
+    FROM associations
+    UNION ALL
+    SELECT to_object_type AS src_type,
+           to_object_id AS src_id,
+           from_object_type AS dst_type,
+           from_object_id AS dst_id
+    FROM associations
+), candidates AS (
+    SELECT contact_edge.src_id AS contact_id,
+           company_edge.dst_id AS company_id,
+           contact_edge.dst_type AS source
+    FROM edges contact_edge
+    JOIN edges company_edge
+      ON company_edge.src_type = contact_edge.dst_type
+     AND company_edge.src_id = contact_edge.dst_id
+     AND company_edge.dst_type = 'companies'
+    WHERE contact_edge.src_type = 'contacts'
+      AND contact_edge.dst_type IN ('deals', 'tickets')
+
+    UNION
+
+    SELECT contact_edge.src_id AS contact_id,
+           company_edge.dst_id AS company_id,
+           contact_edge.dst_type || '_deal' AS source
+    FROM edges contact_edge
+    JOIN edges activity_deal
+      ON activity_deal.src_type = contact_edge.dst_type
+     AND activity_deal.src_id = contact_edge.dst_id
+     AND activity_deal.dst_type = 'deals'
+    JOIN edges company_edge
+      ON company_edge.src_type = 'deals'
+     AND company_edge.src_id = activity_deal.dst_id
+     AND company_edge.dst_type = 'companies'
+    WHERE contact_edge.src_type = 'contacts'
+      AND contact_edge.dst_type IN ('notes', 'calls', 'emails', 'meetings')
+
+    UNION
+
+    SELECT contact_edge.src_id AS contact_id,
+           company_edge.dst_id AS company_id,
+           contact_edge.dst_type || '_company' AS source
+    FROM edges contact_edge
+    JOIN edges company_edge
+      ON company_edge.src_type = contact_edge.dst_type
+     AND company_edge.src_id = contact_edge.dst_id
+     AND company_edge.dst_type = 'companies'
+    WHERE contact_edge.src_type = 'contacts'
+      AND contact_edge.dst_type IN ('notes', 'calls', 'emails', 'meetings')
+), live_candidates AS (
+    SELECT DISTINCT candidates.contact_id,
+           candidates.company_id,
+           candidates.source
+    FROM candidates
+    JOIN objects contacts
+      ON contacts.object_type = 'contacts'
+     AND contacts.id = candidates.contact_id
+     AND NOT contacts.archived
+    JOIN objects companies
+      ON companies.object_type = 'companies'
+     AND companies.id = candidates.company_id
+     AND NOT companies.archived
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM associations existing
+        WHERE existing.association_type_id = 0
+          AND (
+              existing.from_object_type = 'contacts'
+              AND existing.from_object_id = candidates.contact_id
+              AND existing.to_object_type = 'companies'
+              AND existing.to_object_id = candidates.company_id
+            OR
+              existing.from_object_type = 'companies'
+              AND existing.from_object_id = candidates.company_id
+              AND existing.to_object_type = 'contacts'
+              AND existing.to_object_id = candidates.contact_id
+          )
+    )
+)
+SELECT contact_id,
+       company_id,
+       array_agg(DISTINCT source ORDER BY source) AS sources
+FROM live_candidates
+GROUP BY contact_id, company_id
+ORDER BY contact_id, company_id
+"""
+
+
+async def infer_contact_company_associations(
+    *,
+    dry_run: bool = False,
+    conn: asyncpg.Connection | None = None,
+) -> dict[str, Any]:
+    """Infer contact-company links only from existing explicit graph paths."""
+    async with _connection(conn) as active:
+        rows = await active.fetch(_INFER_CONTACT_COMPANY_CANDIDATES_SQL)
+        pairs = [("contacts", int(row["contact_id"]), "companies", int(row["company_id"]), 0) for row in rows]
+        source_counts: dict[str, int] = {}
+        for row in rows:
+            for source in row["sources"]:
+                source_counts[str(source)] = source_counts.get(str(source), 0) + 1
+        if not dry_run and pairs:
+            await bulk_insert_associations(pairs, conn=active)
+    return {
+        "candidates": len(rows),
+        "inserted": 0 if dry_run else len(rows),
+        "sources": source_counts,
+        "dry_run": dry_run,
+    }
 
 
 async def merge_objects(object_type: str, primary_id: int, merged_id: int) -> dict[str, Any] | None:

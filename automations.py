@@ -15,7 +15,13 @@ def _db() -> Any:
 def _event_datetime(value: str | None) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
-    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        number = float(text)
+        if abs(number) > 10_000_000_000:
+            number /= 1000
+        return datetime.fromtimestamp(number, tz=timezone.utc)
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
@@ -198,11 +204,14 @@ async def handle_automations(
     if _migration_active:
         return
     old_props = old_props or {}
-    if object_type == "deals" and new_props.get("pipeline", "default") == "default":
+    if object_type == "deals":
+        pipeline = new_props.get("pipeline", "default")
         stage = new_props.get("dealstage")
-        if stage == "closedwon" and old_props.get("dealstage") != "closedwon":
+        won_stage = "rinnovato" if pipeline == "rinnovi" else "closedwon"
+        lost_stage = "non_rinnovato" if pipeline == "rinnovi" else "closedlost"
+        if stage == won_stage and old_props.get("dealstage") != won_stage:
             await _closed_won(record_id, new_props)
-        elif stage == "closedlost" and old_props.get("dealstage") != "closedlost":
+        elif stage == lost_stage and old_props.get("dealstage") != lost_stage:
             await _closed_lost(record_id, new_props, event_time)
     if object_type == "contacts":
         email_changed = action == "create" or new_props.get("email") != old_props.get("email")

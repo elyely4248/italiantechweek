@@ -16,6 +16,7 @@ MAX_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS = 12
 MAX_SEARCH_RESULTS = 5000
 MUTATING_TOOLS = {"create_record", "update_record"}
+_agent_semaphore = asyncio.Semaphore(4)
 
 OBJECT_TYPES = {
     "contact": "contacts",
@@ -40,6 +41,8 @@ OBJECT_TYPES = {
     "meetings": "meetings",
     "task": "tasks",
     "tasks": "tasks",
+    "quote": "quotes",
+    "quotes": "quotes",
     "user": "users",
     "users": "users",
 }
@@ -445,8 +448,9 @@ PROCEDURA OBBLIGATORIA
 2. Per domande sui dati usa sempre gli strumenti: non rispondere a memoria e non stimare conteggi, importi, ID o stato dei record.
 3. Prima di modificare, devi avere un ID certo. Se l'utente non dà l'ID, cerca il record. Se trovi zero record, dillo; se ne trovi più di uno, elenca le opzioni essenziali e chiedi quale usare. Non scegliere da solo.
 4. Esegui soltanto le modifiche esplicitamente richieste e conserva tutti gli altri campi. Non usare valori segnaposto e non trasformare una richiesta di lettura in una scrittura.
-5. Considera riuscita un'operazione solo se lo strumento restituisce ok=true. Dopo un errore, correggi gli argomenti oppure spiega l'errore; non affermare mai che il lavoro è concluso.
-6. Prima della risposta finale verifica: richiesta soddisfatta, risultato supportato dagli strumenti, nessuna operazione fallita presentata come riuscita. Cita ID o conteggi utili restituiti dagli strumenti.
+5. Se una richiesta non puo essere eseguita cosi com'e perche mancano dati indispensabili, e ambigua, viola queste regole, richiede segreti/dettagli interni, o comporterebbe una modifica non autorizzata, rifiuta quella parte e spiega brevemente il motivo. Se possibile, proponi il dato o la scelta necessaria per procedere.
+6. Considera riuscita un'operazione solo se lo strumento restituisce ok=true. Dopo un errore, correggi gli argomenti oppure spiega l'errore; non affermare mai che il lavoro è concluso.
+7. Prima della risposta finale verifica: richiesta soddisfatta, risultato supportato dagli strumenti, nessuna operazione fallita presentata come riuscita. Cita ID o conteggi utili restituiti dagli strumenti.
 
 REGOLE CRM
 - "I miei clienti" significa aziende collegate ad almeno una trattativa con commerciale uguale all'email dell'utente oppure a un ticket con assegnatario uguale alla sua email: usa search_records su companies con mine_only=true.
@@ -494,7 +498,7 @@ async def _call_openrouter(client: httpx.AsyncClient, api_key: str, messages: li
             "tool_choice": "auto",
             "parallel_tool_calls": False,
             "temperature": 0.2,
-            "max_tokens": 1500,
+            "max_tokens": 3000,
         },
     )
     response.raise_for_status()
@@ -506,6 +510,11 @@ async def _call_openrouter(client: httpx.AsyncClient, api_key: str, messages: li
 
 
 async def handle_agent_request(body: dict) -> str:
+    async with _agent_semaphore:
+        return await _handle_agent_inner(body)
+
+
+async def _handle_agent_inner(body: dict) -> str:
     context_source = body.get("context") or {}
     context = {
         "now": str(context_source.get("now") or "").strip(),

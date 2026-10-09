@@ -13,34 +13,55 @@ import main
 class FakeDB:
     def __init__(self):
         self.records = {kind: {} for kind in main.KNOWN_OBJECT_TYPES}
+        self.archived = {kind: set() for kind in main.KNOWN_OBJECT_TYPES}
         self.associations = set()
         self.claims = set()
         self.next_id = 1
+        self.inferred_contact_company_kwargs = None
 
     async def init_db(self): pass
-    async def reset_db(self): self.records = {kind: {} for kind in main.KNOWN_OBJECT_TYPES}
+    async def reset_db(self):
+        self.records = {kind: {} for kind in main.KNOWN_OBJECT_TYPES}
+        self.archived = {kind: set() for kind in main.KNOWN_OBJECT_TYPES}
 
-    def result(self, kind, record_id):
-        return {"id": str(record_id), "properties": dict(self.records[kind][record_id]),
-                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "archived": False}
+    def result(self, kind, record_id, properties=None):
+        values = dict(self.records[kind][record_id])
+        if properties is not None:
+            requested = dict.fromkeys(properties)
+            requested.update(dict.fromkeys(("hs_object_id", "createdate", "lastmodifieddate")))
+            values = {key: values.get(key) for key in requested}
+        return {"id": str(record_id), "properties": values,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                "archived": record_id in self.archived[kind]}
 
     async def create_object(self, kind, properties, **kwargs):
         record_id, self.next_id = self.next_id, self.next_id + 1
         self.records[kind][record_id] = {key: str(value) for key, value in properties.items()}
         return self.result(kind, record_id)
 
-    async def get_object(self, kind, record_id, properties=None):
-        return self.result(kind, record_id) if record_id in self.records[kind] else None
+    async def get_object(self, kind, record_id, properties=None, archived=False):
+        if record_id not in self.records[kind]:
+            return None
+        if (record_id in self.archived[kind]) != bool(archived):
+            return None
+        return self.result(kind, record_id, properties)
 
     async def update_object(self, kind, record_id, properties):
         self.records[kind][record_id].update({key: str(value) for key, value in properties.items()})
         return self.result(kind, record_id)
 
     async def archive_object(self, kind, record_id):
-        return self.records[kind].pop(record_id, None) is not None
+        if record_id not in self.records[kind] or record_id in self.archived[kind]:
+            return False
+        self.archived[kind].add(record_id)
+        return True
 
     async def list_objects(self, kind, limit=10, after=None, **kwargs):
-        ids = sorted(i for i in self.records[kind] if after is None or i > after)[:limit]
+        archived = bool(kwargs.get("archived", False))
+        ids = sorted(
+            i for i in self.records[kind]
+            if (after is None or i > after) and ((i in self.archived[kind]) == archived)
+        )[:limit]
         return {"results": [self.result(kind, i) for i in ids]}
 
     async def search_objects(self, kind, filter_groups, **kwargs):
@@ -89,11 +110,15 @@ class FakeDB:
     async def get_list_by_name(self, name, object_type="companies"): return {"id": "1", "name": name}
     async def get_list_members(self, list_id, **kwargs): return {"results": []}
     async def add_to_list(self, list_id, ids): pass
+    async def infer_contact_company_associations(self, **kwargs):
+        self.inferred_contact_company_kwargs = kwargs
+        return {"candidates": 2, "inserted": 0 if kwargs.get("dry_run") else 2, "sources": {"deals": 2}, "dry_run": kwargs.get("dry_run")}
 
 
 class BaseAsyncTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.db = FakeDB(); main._db_override = self.db; automations._db_override = self.db
+        main._rate_limit_count = 0
         automations._migration_active = False; os.environ["CRM_TOKEN"] = "secret"
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app, raise_app_exceptions=False),
                                         base_url="http://test", headers={"Authorization": "Bearer secret"})
@@ -164,14 +189,80 @@ class ApiTests(BaseAsyncTest):
 
     async def test_reset_clears_durable_automation_claims(self):
         self.db.claims.add(("deals", 1, "r10_supply_ticket"))
+        await self.client.get("/crm/v3/objects/contacts")
+        self.assertGreater(main._rate_limit_count, 0)
         response = await self.client.post("/__reset")
         self.assertEqual(response.status_code, 204)
         self.assertFalse(self.db.claims)
+        self.assertEqual(main._rate_limit_count, 0)
+
+    async def test_contact_company_inference_endpoint_defaults_to_dry_run(self):
+        response = await self.client.post("/__infer-contact-company-associations", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["dry_run"])
+        self.assertEqual(response.json()["inserted"], 0)
+        self.assertEqual(self.db.inferred_contact_company_kwargs, {"dry_run": True})
+
+        response = await self.client.post("/__infer-contact-company-associations", json={"dry_run": False})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["dry_run"])
+        self.assertEqual(response.json()["inserted"], 2)
 
     async def test_error_envelope(self):
         response = await self.client.get("/crm/v3/objects/contacts/999")
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["category"], "OBJECT_NOT_FOUND")
+
+    async def test_requested_unknown_properties_are_null(self):
+        with patch("automations.handle_automations", new=AsyncMock()):
+            created = await self.client.post(
+                "/crm/v3/objects/contacts",
+                json={"properties": {"email": "ada@example.it"}},
+            )
+        contact_id = created.json()["id"]
+        response = await self.client.get(
+            f"/crm/v3/objects/contacts/{contact_id}?properties=email,missing_prop"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["properties"]["email"], "ada@example.it")
+        self.assertIsNone(response.json()["properties"]["missing_prop"])
+
+    async def test_single_get_can_return_archived_records(self):
+        with patch("automations.handle_automations", new=AsyncMock()):
+            created = await self.client.post(
+                "/crm/v3/objects/companies",
+                json={"properties": {"name": "Archived Spa"}},
+            )
+        company_id = created.json()["id"]
+        self.assertEqual((await self.client.delete(f"/crm/v3/objects/companies/{company_id}")).status_code, 204)
+        self.assertEqual((await self.client.get(f"/crm/v3/objects/companies/{company_id}")).status_code, 404)
+        response = await self.client.get(f"/crm/v3/objects/companies/{company_id}?archived=true")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["archived"])
+
+    async def test_stub_conformity_endpoints(self):
+        labels = await self.client.get("/crm/v3/associations/contacts/companies/labels")
+        self.assertEqual(labels.status_code, 200)
+        self.assertEqual(labels.json()["results"][0]["category"], "HUBSPOT_DEFINED")
+        imported = await self.client.post("/crm/v3/imports", json={"name": "Import test", "files": []})
+        self.assertEqual(imported.status_code, 201)
+        self.assertEqual(imported.json()["state"], "DONE")
+        exported = await self.client.post("/crm/v3/exports", json={"exportType": "VIEW"})
+        self.assertEqual(exported.status_code, 202)
+        self.assertEqual(exported.json()["state"], "COMPLETE")
+
+    async def test_quotes_are_supported_crm_objects(self):
+        with patch("automations.handle_automations", new=AsyncMock()):
+            created = await self.client.post(
+                "/crm/v3/objects/quotes",
+                json={"properties": {"hs_title": "Offerta rinnovo", "amount": 1200}},
+            )
+        self.assertEqual(created.status_code, 201)
+        quote_id = created.json()["id"]
+        fetched = await self.client.get(f"/crm/v3/objects/quotes/{quote_id}?properties=hs_title,amount")
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(fetched.json()["properties"]["hs_title"], "Offerta rinnovo")
+        self.assertEqual(fetched.json()["properties"]["amount"], "1200")
 
 
 class AutomationTests(BaseAsyncTest):
@@ -195,6 +286,24 @@ class AutomationTests(BaseAsyncTest):
         company = await self.db.create_object("companies", {"domain": "main.it", "hs_additional_domains": "alias.it"})
         await automations.handle_automations("contacts", "create", 30, {"email": "a@alias.it"})
         self.assertIn(("contacts", 30, "companies", int(company["id"]), 0), self.db.associations)
+
+    async def test_rinnovi_won_and_lost_trigger_automations(self):
+        won = await self.db.create_object(
+            "deals", {"dealname": "Renewal A", "pipeline": "rinnovi", "dealstage": "rinnovato"}
+        )
+        await automations.handle_automations("deals", "update", int(won["id"]), won["properties"], {"dealstage": "in_trattativa"})
+        self.assertEqual(len(self.db.records["tickets"]), 1)
+        self.assertIn(("tickets", next(iter(self.db.records["tickets"])), "deals", int(won["id"]), 0), self.db.associations)
+
+        lost = await self.db.create_object(
+            "deals", {"dealname": "Renewal B", "pipeline": "rinnovi", "dealstage": "non_rinnovato"}
+        )
+        await automations.handle_automations(
+            "deals", "update", int(lost["id"]), lost["properties"], {"dealstage": "in_trattativa"},
+            event_time="1767268800000",
+        )
+        task = next(reversed(self.db.records["tasks"].values()))
+        self.assertEqual(task["hs_timestamp"], "2026-06-30T12:00:00Z")
 
 
 class AssistantTests(BaseAsyncTest):
