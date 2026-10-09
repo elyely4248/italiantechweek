@@ -324,6 +324,10 @@ body{background:linear-gradient(180deg,#f7fafc 0,#eef4f8 100%);color:var(--ink);
 .chat-toggle{box-shadow:0 12px 26px rgba(255,122,89,.32);font-size:22px}.chat-panel{border-radius:10px;box-shadow:0 20px 46px rgba(25,39,51,.22)}.chat-header{background:linear-gradient(135deg,#253d52,#1c3347)}.chat-user-row select,.chat-input-row input{background:#fff}.chat-input-row input:disabled,.chat-send:disabled{background:#eef3f6}.chat-send{min-width:66px}.chat-msg{box-shadow:0 1px 2px rgba(33,51,67,.05)}.deal-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.deal-reason{display:block;margin-top:6px;color:var(--muted);font-size:12px}.deal-card .deal-meta{margin-top:8px}
 @media (max-width:850px){.sidebar{width:100%;border-right:0}.brand{margin-bottom:10px}.nav{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:14px}.main{margin-left:0;width:100%}.topbar{position:static;align-items:flex-start;gap:12px}.topbar-meta{margin-left:0}.content{padding:18px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.table-wrap{border-radius:7px}.chat-toggle{right:18px;bottom:18px}}
 @media (max-width:560px){.nav{grid-template-columns:1fr}.stats{grid-template-columns:1fr}.topbar{display:block}.topbar-meta{margin-top:12px;flex-wrap:wrap}.content{padding:14px}.kv{grid-template-columns:1fr}.board{grid-auto-columns:88vw}.chat-toggle{width:52px;height:52px}.chat-panel{max-height:calc(100vh - 120px)}}
+.topbar-search{position:relative;display:flex;align-items:center;min-width:280px;max-width:430px;width:32vw;margin-left:auto}.topbar-search+.topbar-meta{margin-left:12px}.search-icon{position:absolute;left:12px;color:var(--muted);font-size:14px;pointer-events:none}.topbar-search input{width:100%;height:38px;border:1px solid var(--line);border-radius:999px;background:#fff;padding:0 38px 0 34px;color:var(--text);font-size:13px;outline:none;box-shadow:var(--shadow-sm)}.topbar-search input:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(0,164,189,.12)}.search-clear{position:absolute;right:7px;width:26px;height:26px;border:0;border-radius:50%;background:#eef3f6;color:var(--muted);cursor:pointer}.search-clear:hover{background:#dbe7ee;color:var(--text)}
+th.sortable{cursor:pointer;user-select:none;white-space:nowrap}.sort-indicator{display:inline-block;width:14px;margin-left:5px;color:var(--muted)}th.sort-asc .sort-indicator:after{content:"\\25B2"}th.sort-desc .sort-indicator:after{content:"\\25BC"}.filter-row th{position:sticky;top:38px;z-index:2;background:#fff;padding:8px 10px}.filter-row input,.filter-row select{width:100%;min-width:90px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:7px 8px;color:var(--text);font-size:12px;text-transform:none;letter-spacing:0;outline:none}.filter-row input:focus,.filter-row select:focus{border-color:var(--teal);box-shadow:0 0 0 2px rgba(0,164,189,.1)}
+tbody tr.row-clickable{cursor:pointer}tbody tr.row-clickable:hover{background:#eef8fb}.chat-actions{display:flex;gap:8px;overflow-x:auto;border-bottom:1px solid var(--line);padding:10px;background:#fff}.chat-action{flex:0 0 auto;border:1px solid var(--line);border-radius:999px;background:#f8fbfd;color:#263d50;padding:7px 10px;font-size:12px;font-weight:750;cursor:pointer}.chat-action:hover{border-color:var(--teal);color:#0b6f8a}.chat-msg.assistant strong{font-weight:800}.chat-msg.assistant ol{margin:6px 0 0 20px;padding:0}.chat-msg.assistant li{margin:4px 0}.chat-msg.assistant .crm-link{color:var(--teal);font-weight:800;text-decoration:none}.chat-msg.assistant .crm-link:hover{text-decoration:underline}
+@media (max-width:850px){.topbar-search{width:100%;max-width:none;min-width:0;margin:12px 0 0}.topbar-search+.topbar-meta{margin-left:0}.topbar-meta{width:100%}}
 """
 
 NAV_LABELS = {
@@ -445,6 +449,16 @@ def _layout(title: str, active: str, body: str, subtitle: str = "") -> str:
         for key, label in NAV_LABELS.items()
     )
     sub = f"<div class='muted'>{_h(subtitle)}</div>" if subtitle else ""
+    topbar_search = (
+        "<div class='topbar-search'>"
+        "<span class='search-icon' aria-hidden='true'>&#128269;</span>"
+        "<input id='globalSearch' type='search' placeholder='Cerca in questa pagina...' "
+        "oninput='filterTable(this.value)' aria-label='Cerca in questa pagina'>"
+        "<button class='search-clear' type='button' "
+        "onclick=\"document.getElementById('globalSearch').value='';filterTable('')\" "
+        "aria-label='Cancella ricerca'>&#10005;</button>"
+        "</div>"
+    )
     topbar_meta = "<div class='topbar-meta'><span class='topbar-pill live'>Live CRM</span><span class='topbar-pill'>AI ready</span></div>"
     token = os.environ.get("CRM_TOKEN", "")
     chat_html = f"""
@@ -459,6 +473,12 @@ def _layout(title: str, active: str, body: str, subtitle: str = "") -> str:
     <select id="chatUser" onchange="switchUser()">
       <option value="">Seleziona utente...</option>
     </select>
+  </div>
+  <div class="chat-actions" aria-label="Azioni rapide">
+    <button class="chat-action" type="button" onclick="quickAsk('Mostrami i miei clienti')">I miei clienti</button>
+    <button class="chat-action" type="button" onclick="quickAsk('Elenca i ticket aperti piu urgenti')">Ticket aperti</button>
+    <button class="chat-action" type="button" onclick="quickAsk('Riassumi il fatturato 2025 per classe cliente')">Fatturato 2025</button>
+    <button class="chat-action" type="button" onclick="quickAsk('Mostrami i clienti dormienti')">Clienti dormienti</button>
   </div>
   <div class="chat-messages" id="chatMessages">
     <div class="chat-msg assistant">Ciao! Sono l'assistente AI di Brambilla CRM. Seleziona il tuo utente e chiedimi quello che vuoi.</div>
@@ -521,14 +541,117 @@ function switchUser(){{
   appendMsg('assistant','Ciao! Come posso aiutarti?');
   chatHistories[currentUser].forEach(m=>appendMsg(m.role,m.content));
 }}
+function normalizeText(value){{
+  return String(value||'').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'');
+}}
+function updateRowDisplay(row){{
+  row.style.display=(row.dataset.searchHidden==='true'||row.dataset.colHidden==='true')?'none':'';
+}}
+function filterTable(query){{
+  const q=normalizeText(query);
+  document.querySelectorAll('.table-wrap table tbody tr').forEach(row=>{{
+    row.dataset.searchHidden=q&&!normalizeText(row.textContent).includes(q)?'true':'false';
+    updateRowDisplay(row);
+  }});
+  document.querySelectorAll('.deal-card').forEach(card=>{{
+    card.style.display=q&&!normalizeText(card.textContent).includes(q)?'none':'';
+  }});
+}}
+function parseSortValue(text){{
+  const raw=String(text||'').trim();
+  const numeric=raw.replace(/[A-Z]{{3}}/g,'').replace(/[^\\d,.\\-]/g,'');
+  if(!numeric)return raw.toLowerCase();
+  let cleaned=numeric;
+  if(cleaned.includes(',')&&cleaned.includes('.'))cleaned=cleaned.replace(/\\./g,'').replace(',','.');
+  else if((cleaned.match(/\\./g)||[]).length>1)cleaned=cleaned.replace(/\\./g,'');
+  else if(cleaned.includes(',')&&!cleaned.includes('.'))cleaned=cleaned.replace(',','.');
+  const parsed=Number(cleaned);
+  return Number.isFinite(parsed)?parsed:raw.toLowerCase();
+}}
+function sortTable(header,columnIndex){{
+  const table=header.closest('table');
+  if(!table)return;
+  const tbody=table.tBodies[0];
+  if(!tbody)return;
+  const dir=header.dataset.sort==='asc'?'desc':'asc';
+  table.querySelectorAll('th.sortable').forEach(th=>{{
+    th.classList.remove('sort-asc','sort-desc');
+    delete th.dataset.sort;
+  }});
+  header.dataset.sort=dir;
+  header.classList.add(dir==='asc'?'sort-asc':'sort-desc');
+  const rows=Array.from(tbody.rows);
+  rows.sort((a,b)=>{{
+    const av=parseSortValue((a.cells[columnIndex]||{{}}).textContent||'');
+    const bv=parseSortValue((b.cells[columnIndex]||{{}}).textContent||'');
+    if(typeof av==='number'&&typeof bv==='number')return dir==='asc'?av-bv:bv-av;
+    return dir==='asc'?String(av).localeCompare(String(bv),'it'):String(bv).localeCompare(String(av),'it');
+  }});
+  rows.forEach(row=>tbody.appendChild(row));
+}}
+function applyColumnFilters(table){{
+  const filters=Array.from(table.querySelectorAll('.col-filter'));
+  Array.from(table.tBodies[0].rows).forEach(row=>{{
+    const hidden=filters.some(input=>{{
+      const value=normalizeText(input.value);
+      if(!value)return false;
+      const cell=row.cells[Number(input.dataset.col)];
+      return !normalizeText(cell?cell.textContent:'').includes(value);
+    }});
+    row.dataset.colHidden=hidden?'true':'false';
+    updateRowDisplay(row);
+  }});
+}}
+function filterCol(input,columnIndex){{
+  input.dataset.col=String(columnIndex);
+  const table=input.closest('table');
+  if(table)applyColumnFilters(table);
+}}
+function escapeHtml(text){{
+  return String(text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+function linkCrmRecords(html){{
+  html=html.replace(/(?:https?:\\/\\/[^\\s<]+)?\\/(contacts|companies|deals|tickets)\\/(\\d+)/g,'<a class="crm-link" href="/$1/$2">$1/$2</a>');
+  return html.replace(/(^|\\s)(contacts|companies|deals|tickets)\\/(\\d+)/g,'$1<a class="crm-link" href="/$2/$3">$2/$3</a>');
+}}
+function renderReply(text){{
+  const escaped=escapeHtml(text);
+  const bolded=escaped.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>');
+  const lines=bolded.split(/\\r?\\n/);
+  let html='';
+  let inList=false;
+  lines.forEach(line=>{{
+    const item=line.match(/^\\s*\\d+\\.\\s+(.*)$/);
+    if(item){{
+      if(!inList){{html+='<ol>';inList=true;}}
+      html+='<li>'+linkCrmRecords(item[1])+'</li>';
+    }}else{{
+      if(inList){{html+='</ol>';inList=false;}}
+      html+=line?'<div>'+linkCrmRecords(line)+'</div>':'<br>';
+    }}
+  }});
+  if(inList)html+='</ol>';
+  return html;
+}}
 function appendMsg(role,text){{
   const d=document.getElementById('chatMessages');
   const m=document.createElement('div');
   m.className='chat-msg '+role;
-  m.textContent=text;
+  if(role==='assistant')m.innerHTML=renderReply(text);
+  else m.textContent=text;
   d.appendChild(m);
   d.scrollTop=d.scrollHeight;
   return m;
+}}
+function quickAsk(text){{
+  if(!currentUser){{
+    appendMsg('assistant','Seleziona un utente per iniziare.');
+    document.getElementById('chatUser').focus();
+    return;
+  }}
+  const inp=document.getElementById('chatInput');
+  inp.value=text;
+  sendChat();
 }}
 async function sendChat(){{
   if(!currentUser)return;
@@ -565,6 +688,21 @@ async function sendChat(){{
   inp.disabled=false;
   inp.focus();
 }}
+document.addEventListener('DOMContentLoaded',()=>{{
+  document.querySelectorAll('.table-wrap table tbody tr').forEach(row=>{{
+    const link=row.querySelector('td:first-child a[href]');
+    if(!link)return;
+    row.classList.add('row-clickable');
+    row.tabIndex=0;
+    row.addEventListener('click',event=>{{
+      if(event.target.closest('a,button,input,select,textarea'))return;
+      window.location.href=link.href;
+    }});
+    row.addEventListener('keydown',event=>{{
+      if(event.key==='Enter')window.location.href=link.href;
+    }});
+  }});
+}});
 </script>
 """
     return (
@@ -573,17 +711,22 @@ async function sendChat(){{
         f"<title>{_h(title)} - Brambilla CRM</title><style>{CRM_CSS}</style></head>"
         f"<body><div class='app'><aside class='sidebar'><div class='brand'>Brambilla CRM</div>"
         f"<nav class='nav'>{navigation}</nav></aside><main class='main'>"
-        f"<header class='topbar'><div><h1>{_h(title)}</h1>{sub}</div>{topbar_meta}</header>"
+        f"<header class='topbar'><div><h1>{_h(title)}</h1>{sub}</div>{topbar_search}{topbar_meta}</header>"
         f"<section class='content'>{body}</section></main></div>{chat_html}</body></html>"
     )
 
 
-def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
-    if not rows:
+def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]], filter_row: str = "") -> str:
+    if not rows and not filter_row:
         return "<div class='table-wrap'><div class='empty'>Nessun record da mostrare.</div></div>"
-    head = "".join(f"<th>{_h(header)}</th>" for header in headers)
+    head = "".join(
+        f"<th class='sortable' onclick='sortTable(this,{index})' scope='col'>{_h(header)}<span class='sort-indicator'></span></th>"
+        for index, header in enumerate(headers)
+    )
     body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows)
-    return f"<div class='table-wrap'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+    if not body:
+        body = f"<tr><td colspan='{len(headers)}'><div class='empty'>Nessun record da mostrare.</div></td></tr>"
+    return f"<div class='table-wrap'><table><thead><tr>{head}</tr>{filter_row}</thead><tbody>{body}</tbody></table></div>"
 
 
 def _pagination(path: str, result: dict[str, Any], after: int | None, limit: int) -> str:
@@ -857,8 +1000,26 @@ async def _render_tickets_page(stage: str = "all", after: int | None = None) -> 
         f"<a class='tab {'active' if stage == stage_id else ''}' href='/tickets?stage={_h(stage_id)}'>{_h(labels.get(stage_id, stage_id))}</a>"
         for stage_id in order
     )
+    stage_options = "".join(
+        f"<option value='{_h(labels.get(stage_id, stage_id))}'>{_h(labels.get(stage_id, stage_id))}</option>"
+        for stage_id in order
+    )
+    filter_row = (
+        "<tr class='filter-row'>"
+        "<th><input class='col-filter' data-col='0' oninput='filterCol(this,0)' placeholder='ID' aria-label='Filtra ID'></th>"
+        "<th><input class='col-filter' data-col='1' oninput='filterCol(this,1)' placeholder='Oggetto' aria-label='Filtra oggetto'></th>"
+        "<th><select class='col-filter' data-col='2' onchange='filterCol(this,2)' aria-label='Filtra priorita'>"
+        "<option value=''>Tutte</option><option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>URGENT</option>"
+        "</select></th>"
+        f"<th><select class='col-filter' data-col='3' onchange='filterCol(this,3)' aria-label='Filtra stage'><option value=''>Tutti</option>{stage_options}</select></th>"
+        "<th><input class='col-filter' data-col='4' oninput='filterCol(this,4)' placeholder='Azienda' aria-label='Filtra azienda'></th>"
+        "<th><input class='col-filter' data-col='5' oninput='filterCol(this,5)' placeholder='Assegnatario' aria-label='Filtra assegnatario'></th>"
+        "<th><input class='col-filter' data-col='6' oninput='filterCol(this,6)' placeholder='Creato' aria-label='Filtra creato'></th>"
+        "<th><input class='col-filter' data-col='7' oninput='filterCol(this,7)' placeholder='Chiuso' aria-label='Filtra chiuso'></th>"
+        "</tr>"
+    )
     body = f"<div class='toolbar'><div class='tabs'>{tabs}</div></div>"
-    body += _table(("ID", "Oggetto", "Priorita", "Stage", "Azienda", "Assegnatario", "Creato", "Chiuso"), rows)
+    body += _table(("ID", "Oggetto", "Priorita", "Stage", "Azienda", "Assegnatario", "Creato", "Chiuso"), rows, filter_row)
     path = "/tickets" if stage == "all" else f"/tickets?stage={_h(stage)}"
     body += _pagination(path, result, after, limit) if stage == "all" else (
         "<div class='pagination'>"
