@@ -38,6 +38,16 @@ def main():
         assert_equal(dicts[0]["note"], "prima riga\r\nseconda riga con ; e euro €", "dict reader")
         assert_equal(parse_legacy_csv_text(sample)[1][2], "prima riga\r\nseconda riga con ; e euro €", "text parser")
 
+        mixed = "id;city;note\r\n1;CantÃ¹;Societ\u00c3\u00a0 conformit\u00c3\u00a0\r\n"
+        mixed_path = Path(directory) / "mixed.csv"
+        mixed_path.write_text(mixed, encoding=LEGACY_ENCODING, newline="")
+        mixed_rows = list(iter_legacy_rows(mixed_path))
+        assert_equal(mixed_rows[1][1], "Cantù", "mojibake city repair")
+        assert_equal(mixed_rows[1][2], "Società conformità", "mojibake text repair")
+        mixed_dicts = list(iter_legacy_dicts(mixed_path))
+        assert_equal(mixed_dicts[0]["city"], "Cantù", "mojibake dict repair")
+        assert_equal(parse_legacy_csv_text(mixed)[1][1], "Cantù", "mojibake text parser repair")
+
     export_dir = Path("legacy/export/sinergia-export")
     if export_dir.exists():
         for name in EXPECTED_HEADERS:

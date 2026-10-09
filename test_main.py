@@ -131,6 +131,10 @@ class BaseAsyncTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ApiTests(BaseAsyncTest):
+    async def test_empty_ticket_priority_badge_has_readable_label(self):
+        self.assertIn("Senza priorita", main._priority_badge(""))
+        self.assertNotIn("> - <", main._priority_badge(""))
+
     async def test_auth_health_and_real_ui(self):
         health = await self.client.get("/health", headers={})
         self.assertEqual(health.status_code, 200)
@@ -353,6 +357,60 @@ class AssistantTests(BaseAsyncTest):
                 json={"context": {"now": "2026-02-01T00:00:00Z"}, "messages": []})
         self.assertEqual(response.json(), {"reply": "Fatto"})
         self.assertEqual(next(iter(self.db.records["tasks"].values()))["hs_timestamp"], "2026-07-31T00:00:00Z")
+
+    async def test_assistant_can_open_filtered_my_clients_view(self):
+        owned_company = await self.db.create_object("companies", {"name": "Cliente Mio", "city": "Roma"})
+        other_company = await self.db.create_object("companies", {"name": "Cliente Altro", "city": "Milano"})
+        owned_deal = await self.db.create_object("deals", {"dealname": "Rinnovo", "commerciale": "anna@example.it"})
+        other_deal = await self.db.create_object("deals", {"dealname": "Altro", "commerciale": "luca@example.it"})
+        await self.db.create_association("deals", int(owned_deal["id"]), "companies", int(owned_company["id"]))
+        await self.db.create_association("deals", int(other_deal["id"]), "companies", int(other_company["id"]))
+
+        assistant = types.ModuleType("assistant")
+        async def handle(body):
+            return {
+                "reply": "Ho aperto i tuoi clienti.",
+                "ui_action_request": {
+                    "type": "open_view",
+                    "view": "companies",
+                    "title": "I miei clienti",
+                    "filters": {"mine_only": True},
+                },
+            }
+        assistant.handle_agent_request = handle
+        with patch.dict(sys.modules, {"assistant": assistant}):
+            response = await self.client.post(
+                "/__agente",
+                json={
+                    "context": {"now": "2026-02-01T00:00:00Z", "user": "anna@example.it"},
+                    "messages": [{"role": "user", "content": "Mostrami i miei clienti"}],
+                },
+            )
+        payload = response.json()
+        self.assertEqual(payload["reply"], "Ho aperto i tuoi clienti.")
+        self.assertEqual(payload["ui_action"]["type"], "open_view")
+        self.assertEqual(payload["ui_action"]["view"], "companies")
+        self.assertIn("Cliente Mio", payload["ui_action"]["html"])
+        self.assertNotIn("Cliente Altro", payload["ui_action"]["html"])
+        self.assertIn("mine_only=True", payload["ui_action"]["url"])
+
+    async def test_filtered_routes_render_matching_deals_and_tickets(self):
+        await self.db.create_object("deals", {"dealname": "Deal Anna", "pipeline": "default", "dealstage": "open", "commerciale": "anna@example.it"})
+        await self.db.create_object("deals", {"dealname": "Deal Luca", "pipeline": "default", "dealstage": "open", "commerciale": "luca@example.it"})
+        deals = await self.client.get("/deals?owner=anna@example.it")
+        self.assertIn("Deal Anna", deals.text)
+        self.assertNotIn("Deal Luca", deals.text)
+
+        await self.db.create_object("tickets", {"subject": "Server giu", "hs_ticket_priority": "URGENT", "hs_pipeline_stage": "aperto", "assegnatario": "anna@example.it"})
+        await self.db.create_object("tickets", {"subject": "Domanda", "hs_ticket_priority": "LOW", "hs_pipeline_stage": "aperto", "assegnatario": "anna@example.it"})
+        tickets = await self.client.get("/tickets?priority=URGENT")
+        self.assertIn("Server giu", tickets.text)
+        self.assertNotIn("Domanda", tickets.text)
+
+    async def test_layout_contains_ui_action_handler(self):
+        html = main._layout("Test", "companies", "")
+        self.assertIn("function openUiAction(action)", html)
+        self.assertIn("if(data.ui_action)openUiAction(data.ui_action);", html)
 
 
 if __name__ == "__main__": unittest.main()

@@ -395,6 +395,14 @@ async def _migrate_files(files: dict[str, Path]) -> None:
     contact_ids = await _insert_batches("contacts", [{k: v for k, v in merged.items() if not k.startswith("_")} for merged, _ in contact_groups])
     contact_by_legacy: dict[str, int] = {}
     associations: list[tuple[str, int, str, int, int]] = []
+    inferred_contact_company_pairs: set[tuple[int, int]] = set()
+
+    def remember_contact_company(contact_legacy: str, company_legacy: str) -> None:
+        contact_id = contact_by_legacy.get(contact_legacy)
+        company_id = company_by_legacy.get(company_legacy)
+        if contact_id and company_id:
+            inferred_contact_company_pairs.add((contact_id, company_id))
+
     for db_id, (merged, members) in zip(contact_ids, contact_groups):
         for member in members:
             contact_by_legacy[member["id_legacy"]] = db_id
@@ -448,6 +456,7 @@ async def _migrate_files(files: dict[str, Path]) -> None:
         deal_refs.append((legacy_id, raw_company if raw_company in live_company_ids else "", contacts))
     deal_ids = await _insert_batches("deals", deal_rows)
     deal_by_legacy = {legacy: db_id for db_id, (legacy, _, _) in zip(deal_ids, deal_refs)}
+    deal_company_by_legacy = {legacy: company_legacy for legacy, company_legacy, _ in deal_refs if company_legacy}
     associations = []
     for db_id, (_, company_legacy, contacts) in zip(deal_ids, deal_refs):
         if company_legacy in company_by_legacy:
@@ -455,6 +464,7 @@ async def _migrate_files(files: dict[str, Path]) -> None:
         for contact_legacy in dict.fromkeys(contacts):
             if contact_legacy in contact_by_legacy:
                 associations.append(("deals", db_id, "contacts", contact_by_legacy[contact_legacy], 0))
+                remember_contact_company(contact_legacy, company_legacy)
     await _insert_associations(associations)
 
     line_rows: list[dict[str, str]] = []
@@ -523,6 +533,7 @@ async def _migrate_files(files: dict[str, Path]) -> None:
             associations.append(("tickets", db_id, "contacts", contact_by_legacy[contact_legacy], 0))
         if company_legacy in company_by_legacy:
             associations.append(("tickets", db_id, "companies", company_by_legacy[company_legacy], 0))
+            remember_contact_company(contact_legacy, company_legacy)
     await _insert_associations(associations)
     await _preserve_createdates([(db_id, ref[2]) for db_id, ref in zip(ticket_ids, ticket_refs)])
 
@@ -541,6 +552,7 @@ async def _migrate_files(files: dict[str, Path]) -> None:
                 batch_associations.append((activity_type, db_id, "contacts", contact_by_legacy[contact_legacy], 0))
             if deal_legacy in deal_by_legacy:
                 batch_associations.append((activity_type, db_id, "deals", deal_by_legacy[deal_legacy], 0))
+                remember_contact_company(contact_legacy, deal_company_by_legacy.get(deal_legacy, ""))
         await _insert_associations(batch_associations)
         rows.clear()
         refs.clear()
@@ -565,7 +577,9 @@ async def _migrate_files(files: dict[str, Path]) -> None:
     for activity_type in body_properties:
         await flush(activity_type)
 
-    await _db().infer_contact_company_associations()
+    await _insert_associations(
+        [("contacts", contact_id, "companies", company_id, 0) for contact_id, company_id in inferred_contact_company_pairs]
+    )
     await _calculate_revenue()
     await _create_dormant_list()
 

@@ -3,11 +3,13 @@ import contextvars
 import html
 import importlib
 import inspect
+import json
 import os
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -403,7 +405,7 @@ def _class_badge(value: Any) -> str:
 def _priority_badge(value: Any) -> str:
     priority = str(value or "").upper()
     colors = {"LOW": "gray", "MEDIUM": "blue", "HIGH": "orange", "URGENT": "red"}
-    return _badge(priority or "-", colors.get(priority, "gray"))
+    return _badge(priority or "Senza priorita", colors.get(priority, "gray"))
 
 
 def _stage_badge(stage: str, label: str | None = None) -> str:
@@ -450,6 +452,31 @@ def _stage_total_label(deals: list[dict[str, Any]]) -> str:
         total = sum(_number(_prop(deal, "amount")) or 0 for deal in deals)
         return _money(total, currency)
     return "multi-valuta"
+
+
+def _record_text(record: dict[str, Any], fields: tuple[str, ...] | None = None) -> str:
+    props = _props(record)
+    keys = fields or tuple(props.keys())
+    return " ".join(str(props.get(key, "")) for key in keys).lower()
+
+
+def _matches_query(record: dict[str, Any], query: str, fields: tuple[str, ...] | None = None) -> bool:
+    text = str(query or "").strip().lower()
+    return not text or text in _record_text(record, fields)
+
+
+def _eq_filter(name: str, value: Any) -> list[dict[str, Any]]:
+    text = str(value or "").strip()
+    return [{"propertyName": name, "operator": "EQ", "value": text}] if text else []
+
+
+def _ui_url(path: str, filters: dict[str, Any]) -> str:
+    query = {
+        key: value
+        for key, value in filters.items()
+        if value not in (None, "", False) and key not in {"html", "records"}
+    }
+    return path + (f"?{urlencode(query)}" if query else "")
 
 
 OPEN_DEAL_STAGES = {
@@ -630,7 +657,7 @@ def _layout(title: str, active: str, body: str, subtitle: str = "") -> str:
         "</div>"
     )
     topbar_meta = "<div class='topbar-meta'><span class='topbar-pill live'>Live CRM</span><span class='topbar-pill'>AI ready</span></div>"
-    token = os.environ.get("CRM_TOKEN", "")
+    token_json = json.dumps(os.environ.get("CRM_TOKEN", ""))
     chat_html = f"""
 <button class="chat-toggle" onclick="toggleChat()" title="Assistente AI" aria-label="Apri assistente AI" aria-controls="chatPanel" aria-expanded="false">&#128172;</button>
 <div class="chat-panel" id="chatPanel">
@@ -659,7 +686,7 @@ def _layout(title: str, active: str, body: str, subtitle: str = "") -> str:
   </div>
 </div>
 <script>
-const CRM_TOKEN="{_h(token)}";
+const CRM_TOKEN={token_json};
 const chatHistories={{}};
 let currentUser="";
 function toggleChat(){{
@@ -777,6 +804,56 @@ function filterCol(input,columnIndex){{
   const table=input.closest('table');
   if(table)applyColumnFilters(table);
 }}
+function activateNav(view){{
+  document.querySelectorAll('.nav a').forEach(link=>{{
+    const key=(link.getAttribute('href')||'').replace(/^\\//,'').split('?')[0];
+    link.classList.toggle('active',key===view);
+  }});
+}}
+function wireClickableRows(){{
+  document.querySelectorAll('.table-wrap table tbody tr').forEach(row=>{{
+    if(row.dataset.clickWired==='true')return;
+    const link=row.querySelector('td:first-child a[href]');
+    if(!link)return;
+    row.dataset.clickWired='true';
+    row.classList.add('row-clickable');
+    row.tabIndex=0;
+    row.addEventListener('click',event=>{{
+      if(event.target.closest('a,button,input,select,textarea'))return;
+      window.location.href=link.href;
+    }});
+    row.addEventListener('keydown',event=>{{
+      if(event.key==='Enter')window.location.href=link.href;
+    }});
+  }});
+}}
+function openUiAction(action){{
+  if(!action||action.type!=='open_view')return;
+  const content=document.querySelector('.content');
+  const title=document.querySelector('.topbar h1');
+  const titleWrap=title?title.parentElement:null;
+  if(content&&typeof action.html==='string')content.innerHTML=action.html;
+  if(title)title.textContent=action.title||title.textContent;
+  if(titleWrap){{
+    let subtitle=titleWrap.querySelector('.muted');
+    if(action.subtitle){{
+      if(!subtitle){{
+        subtitle=document.createElement('div');
+        subtitle.className='muted';
+        titleWrap.appendChild(subtitle);
+      }}
+      subtitle.textContent=action.subtitle;
+    }}else if(subtitle){{
+      subtitle.remove();
+    }}
+  }}
+  activateNav(action.view);
+  if(action.url)history.pushState({{uiAction:true}},'',action.url);
+  if(action.title)document.title=action.title+' - Brambilla CRM';
+  const search=document.getElementById('globalSearch');
+  if(search)search.value='';
+  wireClickableRows();
+}}
 function escapeHtml(text){{
   return String(text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }}
@@ -848,6 +925,7 @@ async function sendChat(){{
     const data=await res.json();
     const reply=data.reply||'Errore nella risposta.';
     typing.remove();
+    if(data.ui_action)openUiAction(data.ui_action);
     appendMsg('assistant',reply);
     chatHistories[currentUser].push({{role:'assistant',content:reply}});
   }}catch(e){{
@@ -858,21 +936,7 @@ async function sendChat(){{
   inp.disabled=false;
   inp.focus();
 }}
-document.addEventListener('DOMContentLoaded',()=>{{
-  document.querySelectorAll('.table-wrap table tbody tr').forEach(row=>{{
-    const link=row.querySelector('td:first-child a[href]');
-    if(!link)return;
-    row.classList.add('row-clickable');
-    row.tabIndex=0;
-    row.addEventListener('click',event=>{{
-      if(event.target.closest('a,button,input,select,textarea'))return;
-      window.location.href=link.href;
-    }});
-    row.addEventListener('keydown',event=>{{
-      if(event.key==='Enter')window.location.href=link.href;
-    }});
-  }});
-}});
+document.addEventListener('DOMContentLoaded',wireClickableRows);
 </script>
 """
     return (
@@ -1217,7 +1281,21 @@ def _stage_maps(pipeline: dict[str, Any] | None) -> tuple[dict[str, str], list[s
     return labels, order
 
 
-async def _render_companies_page(after: int | None = None) -> str:
+async def _render_companies_page(
+    after: int | None = None,
+    filters: dict[str, Any] | None = None,
+    user_email: str = "",
+) -> str:
+    if filters:
+        records = await _filtered_company_records(filters, user_email)
+        title = "I miei clienti" if filters.get("mine_only") else "Aziende filtrate"
+        body = (
+            "<div class='toolbar'><div>"
+            f"<div class='muted'>{len(records)} aziende caricate dal CRM</div>"
+            "</div><span class='badge blue'>Vista filtrata</span></div>"
+        )
+        body += _companies_table(records)
+        return _layout(title, "companies", body, "Schede azienda e riepilogo clienti")
     limit = 50
     result = await _call_db("list_objects", "companies", limit=limit, after=after)
     rows = []
@@ -1236,6 +1314,58 @@ async def _render_companies_page(after: int | None = None) -> str:
     body = _table(("Nome", "Dominio", "Citta", "Provincia", "Classe Cliente", "Fatturato 2025"), rows)
     body += _pagination("/companies", result, after, limit)
     return _layout("Aziende", "companies", body, "Schede azienda e riepilogo clienti")
+
+
+def _companies_table(records: list[dict[str, Any]]) -> str:
+    rows = []
+    for record in records:
+        props = _props(record)
+        company_id = _h(record.get("id", ""))
+        name = props.get("name") or f"Azienda {company_id}"
+        rows.append((
+            f"<a href='/companies/{company_id}'>{_h(name)}</a>",
+            _h(props.get("domain", "")),
+            _h(props.get("city", "")),
+            _h(props.get("state", "")),
+            _class_badge(props.get("classe_cliente")),
+            _money(props.get("fatturato_2025")),
+        ))
+    return _table(("Nome", "Dominio", "Citta", "Provincia", "Classe Cliente", "Fatturato 2025"), rows)
+
+
+async def _my_company_records(user_email: str) -> list[dict[str, Any]]:
+    company_ids: set[int] = set()
+    for object_type, owner_field in (("deals", "commerciale"), ("tickets", "assegnatario")):
+        owned = await _all_search_results(
+            object_type,
+            [{"filters": [{"propertyName": owner_field, "operator": "EQ", "value": user_email}]}],
+        )
+        for record in owned:
+            for association in await read_associations(object_type, int(record.get("id", 0)), "companies"):
+                company_ids.add(int(association["id"]))
+    return await _get_many("companies", sorted(company_ids))
+
+
+def _filter_companies(records: list[dict[str, Any]], filters: dict[str, Any]) -> list[dict[str, Any]]:
+    result = records
+    if filters.get("q"):
+        result = [
+            record for record in result
+            if _matches_query(record, str(filters["q"]), ("name", "domain", "city", "state", "classe_cliente"))
+        ]
+    for prop_name, filter_name in (("classe_cliente", "class"), ("city", "city"), ("state", "state"), ("domain", "domain")):
+        value = str(filters.get(filter_name) or "").strip().lower()
+        if value:
+            result = [record for record in result if _prop(record, prop_name).lower() == value]
+    return result
+
+
+async def _filtered_company_records(filters: dict[str, Any], user_email: str) -> list[dict[str, Any]]:
+    if filters.get("mine_only"):
+        records = await _my_company_records(user_email or str(filters.get("user") or "").strip().lower())
+    else:
+        records = await _all_search_results("companies", [])
+    return _filter_companies(records, filters)
 
 
 async def _render_contacts_page(after: int | None = None) -> str:
@@ -1349,7 +1479,22 @@ async def ui_company_detail(company_id: int):
     return HTMLResponse(await _render_company_detail(company_id))
 
 
-async def _render_deals_page(pipeline: str | None = None) -> str:
+async def _render_deals_page(
+    pipeline: str | None = None,
+    stage: str | None = None,
+    owner: str | None = None,
+    q: str | None = None,
+) -> str:
+    if stage or owner or q:
+        filters = {"pipeline": pipeline or "default", "stage": stage, "owner": owner, "q": q}
+        records = await _filtered_deal_records(filters)
+        body = (
+            "<div class='toolbar'><div>"
+            f"<div class='muted'>{len(records)} trattative caricate dal CRM</div>"
+            "</div><span class='badge blue'>Vista filtrata</span></div>"
+        )
+        body += await _deals_table(records)
+        return _layout("Trattative filtrate", "deals", body, "Board per pipeline e fase")
     pipelines = await _call_db("list_pipelines", "deals")
     selected = pipeline or "default"
     if pipelines and selected not in {str(item.get("id")) for item in pipelines}:
@@ -1401,12 +1546,73 @@ async def _render_deals_page(pipeline: str | None = None) -> str:
     return _layout("Trattative", "deals", body, "Board per pipeline e fase")
 
 
+async def _deals_table(records: list[dict[str, Any]]) -> str:
+    rows = []
+    for deal in records:
+        deal_id = int(deal.get("id", 0))
+        company_name = await _company_name_for("deals", deal_id)
+        rows.append((
+            _h(deal.get("id", "")),
+            _h(_prop(deal, "dealname", "Trattativa")),
+            _h(company_name),
+            _h(_prop(deal, "commerciale", "")),
+            _h(_prop(deal, "pipeline", "")),
+            _stage_badge(_prop(deal, "dealstage")),
+            _deal_amount(deal),
+            _h(_date_short(_prop(deal, "closedate"))),
+        ))
+    return _table(("ID", "Nome", "Azienda", "Commerciale", "Pipeline", "Fase", "Importo", "Chiusura"), rows)
+
+
+async def _filtered_deal_records(filters: dict[str, Any]) -> list[dict[str, Any]]:
+    db_filters: list[dict[str, Any]] = []
+    db_filters.extend(_eq_filter("pipeline", filters.get("pipeline")))
+    db_filters.extend(_eq_filter("dealstage", filters.get("stage") or filters.get("dealstage")))
+    db_filters.extend(_eq_filter("commerciale", filters.get("owner") or filters.get("commerciale")))
+    groups = [{"filters": db_filters}] if db_filters else []
+    records = await _all_search_results("deals", groups)
+    if filters.get("q"):
+        records = [
+            record for record in records
+            if _matches_query(record, str(filters["q"]), ("dealname", "commerciale", "pipeline", "dealstage", "amount"))
+        ]
+    return records
+
+
 @app.get("/deals", response_class=HTMLResponse, include_in_schema=False)
-async def ui_deals(pipeline: str | None = None):
-    return HTMLResponse(await _render_deals_page(pipeline))
+async def ui_deals(
+    pipeline: str | None = None,
+    stage: str | None = None,
+    owner: str | None = None,
+    q: str | None = None,
+):
+    return HTMLResponse(await _render_deals_page(pipeline, stage, owner, q))
 
 
-async def _render_tickets_page(stage: str = "all", after: int | None = None) -> str:
+async def _render_tickets_page(
+    stage: str = "all",
+    after: int | None = None,
+    priority: str | None = None,
+    owner: str | None = None,
+    q: str | None = None,
+    open_only: bool = False,
+) -> str:
+    if priority or owner or q or open_only:
+        filters = {
+            "stage": None if stage == "all" else stage,
+            "priority": priority,
+            "owner": owner,
+            "q": q,
+            "open_only": open_only,
+        }
+        records = await _filtered_ticket_records(filters)
+        body = (
+            "<div class='toolbar'><div>"
+            f"<div class='muted'>{len(records)} ticket caricati dal CRM</div>"
+            "</div><span class='badge blue'>Vista filtrata</span></div>"
+        )
+        body += await _tickets_table(records)
+        return _layout("Ticket filtrati", "tickets", body, "Assistenza clienti per priorita e stato")
     limit = 50
     pipelines = await _call_db("list_pipelines", "tickets")
     pipeline_obj = next((item for item in pipelines if str(item.get("id")) == "assistenza"), pipelines[0] if pipelines else None)
@@ -1467,9 +1673,52 @@ async def _render_tickets_page(stage: str = "all", after: int | None = None) -> 
     return _layout("Ticket", "tickets", body, "Assistenza clienti per priorita e stato")
 
 
+async def _tickets_table(records: list[dict[str, Any]]) -> str:
+    rows = []
+    for ticket in records:
+        ticket_id = int(ticket.get("id", 0))
+        company = await _company_name_for("tickets", ticket_id)
+        ticket_stage = _prop(ticket, "hs_pipeline_stage")
+        rows.append((
+            _h(ticket.get("id", "")),
+            _h(_prop(ticket, "subject", "")),
+            _priority_badge(_prop(ticket, "hs_ticket_priority")),
+            _stage_badge(ticket_stage),
+            _h(company),
+            _h(_prop(ticket, "assegnatario", "")),
+            _h(_date_short(_prop(ticket, "createdate"))),
+            _h(_date_short(_prop(ticket, "closed_date"))),
+        ))
+    return _table(("ID", "Oggetto", "Priorita", "Stage", "Azienda", "Assegnatario", "Creato", "Chiuso"), rows)
+
+
+async def _filtered_ticket_records(filters: dict[str, Any]) -> list[dict[str, Any]]:
+    db_filters: list[dict[str, Any]] = []
+    db_filters.extend(_eq_filter("hs_pipeline_stage", filters.get("stage")))
+    db_filters.extend(_eq_filter("hs_ticket_priority", filters.get("priority")))
+    db_filters.extend(_eq_filter("assegnatario", filters.get("owner") or filters.get("assignee") or filters.get("assegnatario")))
+    groups = [{"filters": db_filters}] if db_filters else []
+    records = await _all_search_results("tickets", groups)
+    if filters.get("open_only"):
+        records = [record for record in records if _prop(record, "hs_pipeline_stage").lower() not in CLOSED_TICKET_STAGES]
+    if filters.get("q"):
+        records = [
+            record for record in records
+            if _matches_query(record, str(filters["q"]), ("subject", "content", "hs_ticket_priority", "hs_pipeline_stage", "assegnatario"))
+        ]
+    return records
+
+
 @app.get("/tickets", response_class=HTMLResponse, include_in_schema=False)
-async def ui_tickets(stage: str = "all", after: int | None = None):
-    return HTMLResponse(await _render_tickets_page(stage, after))
+async def ui_tickets(
+    stage: str = "all",
+    after: int | None = None,
+    priority: str | None = None,
+    owner: str | None = None,
+    q: str | None = None,
+    open_only: bool = False,
+):
+    return HTMLResponse(await _render_tickets_page(stage, after, priority, owner, q, open_only))
 
 
 async def _last_won_deal_date(company_id: int) -> str:
@@ -1516,16 +1765,118 @@ async def _render_dormant_page() -> str:
     return _layout("Clienti dormienti", "dormant", body, "Lista commerciale prioritaria")
 
 
+async def _dormant_company_records() -> list[dict[str, Any]]:
+    definition = await _call_db("get_list_by_name", "Clienti dormienti", "companies")
+    companies: list[dict[str, Any]] = []
+    if not definition:
+        return companies
+    after = None
+    while True:
+        page = await _call_db("get_list_members", int(definition["id"]), limit=200, after=after)
+        ids = [int(item.get("recordId") or item.get("id")) for item in page.get("results", [])]
+        companies.extend(await _get_many("companies", ids))
+        after = page.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            return companies
+
+
+async def _dormant_table(records: list[dict[str, Any]]) -> str:
+    rows = []
+    for company in records:
+        company_id = int(company.get("id", 0))
+        props = _props(company)
+        rows.append((
+            f"<a href='/companies/{company_id}'>{_h(props.get('name', f'Azienda {company_id}'))}</a>",
+            _h(props.get("domain", "")),
+            _h(props.get("city", "")),
+            _money(props.get("fatturato_2025")),
+            _class_badge(props.get("classe_cliente")),
+            _h(await _last_won_deal_date(company_id)),
+        ))
+    return _table(("Azienda", "Dominio", "Citta", "Fatturato 2025", "Classe", "Ultima vittoria"), rows)
+
+
+async def build_open_view_action(requested: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    view = str(requested.get("view") or "").strip().lower()
+    if view not in {"companies", "deals", "tickets", "dormant"}:
+        raise api_error(400, f"Unsupported CRM view: {view}")
+    filters = dict(requested.get("filters") or {})
+    user_email = str((context or {}).get("user") or "").strip().lower()
+    if filters.get("mine_only") and user_email and not filters.get("user"):
+        filters["user"] = user_email
+
+    if view == "companies":
+        records = await _filtered_company_records(filters, user_email)
+        html_body = _companies_table(records)
+        default_title = "I miei clienti" if filters.get("mine_only") else "Aziende filtrate"
+        subtitle = f"{len(records)} aziende caricate dal CRM"
+        url = _ui_url("/companies", filters)
+    elif view == "deals":
+        records = await _filtered_deal_records(filters)
+        html_body = await _deals_table(records)
+        default_title = "Trattative filtrate"
+        subtitle = f"{len(records)} trattative caricate dal CRM"
+        url = _ui_url("/deals", filters)
+    elif view == "tickets":
+        records = await _filtered_ticket_records(filters)
+        html_body = await _tickets_table(records)
+        default_title = "Ticket filtrati"
+        subtitle = f"{len(records)} ticket caricati dal CRM"
+        url = _ui_url("/tickets", filters)
+    else:
+        records = _filter_companies(await _dormant_company_records(), filters)
+        html_body = await _dormant_table(records)
+        default_title = "Clienti dormienti"
+        subtitle = f"{len(records)} aziende dormienti caricate dal CRM"
+        url = _ui_url("/dormant", filters)
+
+    title = str(requested.get("title") or default_title)
+    toolbar = (
+        "<div class='toolbar'><div>"
+        f"<div class='muted'>{_h(subtitle)}</div>"
+        f"</div><span class='badge blue'>Vista AI</span></div>"
+    )
+    return {
+        "type": "open_view",
+        "view": view,
+        "title": title,
+        "subtitle": str(requested.get("subtitle") or subtitle),
+        "url": url,
+        "filters": filters,
+        "html": toolbar + html_body,
+        "count": len(records),
+    }
+
+
 @app.get("/dormant", response_class=HTMLResponse, include_in_schema=False)
 async def ui_dormant():
     return HTMLResponse(await _render_dormant_page())
 
 
 @app.get("/{object_type}", response_class=HTMLResponse, include_in_schema=False)
-async def ui_records(object_type: str, after: int | None = None):
+async def ui_records(
+    object_type: str,
+    after: int | None = None,
+    mine_only: bool = False,
+    user: str | None = None,
+    q: str | None = None,
+    customer_class: str | None = Query(None, alias="class"),
+    city: str | None = None,
+    state: str | None = None,
+    domain: str | None = None,
+):
     object_type = normalize_object_type(object_type)
     if object_type == "companies":
-        return HTMLResponse(await _render_companies_page(after))
+        filters = {
+            "mine_only": mine_only,
+            "q": q,
+            "class": customer_class,
+            "city": city,
+            "state": state,
+            "domain": domain,
+        }
+        has_filters = any(value not in (None, "", False) for value in filters.values())
+        return HTMLResponse(await _render_companies_page(after, filters if has_filters else None, user or ""))
     if object_type == "contacts":
         return HTMLResponse(await _render_contacts_page(after))
     if object_type not in UI_TYPES:
@@ -1581,6 +1932,13 @@ async def agent(body: dict[str, Any]) -> dict[str, Any]:
             result = await handler(body)
     finally:
         _mutation_event_time.reset(token)
+    if isinstance(result, dict):
+        reply = str(result.get("reply") or "")
+        action_request = result.get("ui_action") or result.get("ui_action_request")
+        payload: dict[str, Any] = {"reply": reply}
+        if isinstance(action_request, dict):
+            payload["ui_action"] = await build_open_view_action(action_request, body.get("context") or {})
+        return payload
     return {"reply": result}
 
 

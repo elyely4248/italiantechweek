@@ -53,6 +53,14 @@ class AssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(name, "search_records")
         self.assertEqual(arguments["object_type"], "companies")
 
+    def test_tool_validation_accepts_open_crm_view(self):
+        name, arguments = assistant._validate_tool_call(
+            "open_crm_view",
+            {"view": "companies", "filters": {"mine_only": True}},
+        )
+        self.assertEqual(name, "open_crm_view")
+        self.assertEqual(arguments["filters"], {"mine_only": True})
+
     async def test_my_customers_unions_deal_and_ticket_ownership(self):
         fake = FakeDb()
         with patch.object(assistant, "_db", return_value=fake):

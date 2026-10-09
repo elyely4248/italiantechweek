@@ -108,6 +108,19 @@ def legacy_csv_reader(handle: IO[str]) -> csv.reader:
     return csv.reader(handle, delimiter=LEGACY_DELIMITER)
 
 
+def repair_mojibake(value: str) -> str:
+    """Fix UTF-8 bytes that were decoded as cp1252 inside legacy exports."""
+    try:
+        repaired = value.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return value
+    return repaired
+
+
+def _repair_row(row: list[str]) -> list[str]:
+    return [repair_mojibake(value) for value in row]
+
+
 def open_legacy_csv(path: str | Path) -> IO[str]:
     """Open a legacy CSV file with the expected Windows-1252 encoding.
 
@@ -120,7 +133,8 @@ def open_legacy_csv(path: str | Path) -> IO[str]:
 def iter_legacy_rows(path: str | Path) -> Iterator[list[str]]:
     """Yield raw rows from a legacy CSV file."""
     with open_legacy_csv(path) as handle:
-        yield from legacy_csv_reader(handle)
+        for row in legacy_csv_reader(handle):
+            yield _repair_row(row)
 
 
 def iter_legacy_dicts(path: str | Path) -> Iterator[dict[str, str]]:
@@ -137,7 +151,7 @@ def iter_legacy_dicts(path: str | Path) -> Iterator[dict[str, str]]:
             missing = [key for key, value in row.items() if value is None]
             if missing:
                 raise ValueError(f"{path}: row {line_number} is missing columns: {missing!r}")
-            yield row
+            yield {key: repair_mojibake(value) for key, value in row.items()}
 
 
 def parse_legacy_csv_text(text: str) -> list[list[str]]:
@@ -145,7 +159,7 @@ def parse_legacy_csv_text(text: str) -> list[list[str]]:
 
     Useful for CRM assistant attachments, which arrive as text instead of files.
     """
-    return list(csv.reader(StringIO(text, newline=""), delimiter=LEGACY_DELIMITER))
+    return [_repair_row(row) for row in csv.reader(StringIO(text, newline=""), delimiter=LEGACY_DELIMITER)]
 
 
 def count_legacy_records(path: str | Path) -> int:

@@ -205,6 +205,21 @@ def _aggregate(records: list[dict[str, Any]], spec: dict[str, Any] | None) -> di
 
 
 async def _execute_tool(name: str, arguments: dict[str, Any], context: dict[str, str]) -> Any:
+    if name == "open_crm_view":
+        view = str(arguments["view"]).strip().lower()
+        filters = arguments.get("filters") or {}
+        if view not in {"companies", "deals", "tickets", "dormant"}:
+            raise ValueError(f"Vista CRM non supportata: {view}")
+        if not isinstance(filters, dict):
+            raise ValueError("filters deve essere un oggetto JSON")
+        return {
+            "type": "open_view",
+            "view": view,
+            "title": str(arguments.get("title") or "").strip(),
+            "subtitle": str(arguments.get("subtitle") or "").strip(),
+            "filters": filters,
+        }
+
     if name == "search_records":
         object_type = _object_type(arguments["object_type"])
         filters = arguments.get("filters") or []
@@ -288,6 +303,7 @@ def _validate_tool_call(name: Any, arguments: Any) -> tuple[str, dict[str, Any]]
         raise ValueError("Gli argomenti dello strumento devono essere un oggetto JSON")
 
     required = {
+        "open_crm_view": {"view", "filters"},
         "search_records": {"object_type"},
         "get_record": {"object_type", "record_id"},
         "create_record": {"object_type", "properties"},
@@ -297,6 +313,13 @@ def _validate_tool_call(name: Any, arguments: Any) -> tuple[str, dict[str, Any]]
     missing = sorted(key for key in required if key not in arguments)
     if missing:
         raise ValueError(f"Argomenti obbligatori mancanti: {', '.join(missing)}")
+
+    if name == "open_crm_view":
+        if str(arguments["view"]).strip().lower() not in {"companies", "deals", "tickets", "dormant"}:
+            raise ValueError(f"Vista CRM non supportata: {arguments['view']}")
+        if not isinstance(arguments.get("filters"), dict):
+            raise ValueError("filters deve essere un oggetto JSON")
+        return name, arguments
 
     _object_type(arguments["object_type"])
     if "record_id" in required:
@@ -319,6 +342,42 @@ def _validate_tool_call(name: Any, arguments: Any) -> tuple[str, dict[str, Any]]
 
 
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "open_crm_view",
+            "description": "Apre una vista CRM filtrata nell'interfaccia principale per richieste di visualizzazione dati. Usalo per 'mostrami', 'fammi vedere', 'apri', 'i miei clienti', ticket/trattative filtrati o clienti dormienti; non usarlo per modifiche.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "view": {"type": "string", "enum": ["companies", "deals", "tickets", "dormant"]},
+                    "title": {"type": "string"},
+                    "subtitle": {"type": "string"},
+                    "filters": {
+                        "type": "object",
+                        "properties": {
+                            "mine_only": {"type": "boolean"},
+                            "q": {"type": "string"},
+                            "class": {"type": "string"},
+                            "city": {"type": "string"},
+                            "state": {"type": "string"},
+                            "domain": {"type": "string"},
+                            "pipeline": {"type": "string"},
+                            "stage": {"type": "string"},
+                            "owner": {"type": "string"},
+                            "commerciale": {"type": "string"},
+                            "assignee": {"type": "string"},
+                            "assegnatario": {"type": "string"},
+                            "priority": {"type": "string"},
+                            "open_only": {"type": "boolean"},
+                        },
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["view", "filters"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -446,6 +505,7 @@ Calcola oggi, domani e ogni data relativa esclusivamente da questa data, mai dal
 PROCEDURA OBBLIGATORIA
 1. Identifica oggetti, filtri, campi e risultato richiesto. Non aggiungere dettagli non forniti.
 2. Per domande sui dati usa sempre gli strumenti: non rispondere a memoria e non stimare conteggi, importi, ID o stato dei record.
+2b. Quando l'utente chiede di vedere, mostrare, aprire o filtrare record CRM nell'app, usa open_crm_view per aprire la vista nell'interfaccia principale invece di elencare molti record in chat. La risposta chat deve essere breve.
 3. Prima di modificare, devi avere un ID certo. Se l'utente non dà l'ID, cerca il record. Se trovi zero record, dillo; se ne trovi più di uno, elenca le opzioni essenziali e chiedi quale usare. Non scegliere da solo.
 4. Esegui soltanto le modifiche esplicitamente richieste e conserva tutti gli altri campi. Non usare valori segnaposto e non trasformare una richiesta di lettura in una scrittura.
 5. Se una richiesta non puo essere eseguita cosi com'e perche mancano dati indispensabili, e ambigua, viola queste regole, richiede segreti/dettagli interni, o comporterebbe una modifica non autorizzata, rifiuta quella parte e spiega brevemente il motivo. Se possibile, proponi il dato o la scelta necessaria per procedere.
@@ -453,7 +513,7 @@ PROCEDURA OBBLIGATORIA
 7. Prima della risposta finale verifica: richiesta soddisfatta, risultato supportato dagli strumenti, nessuna operazione fallita presentata come riuscita. Cita ID o conteggi utili restituiti dagli strumenti.
 
 REGOLE CRM
-- "I miei clienti" significa aziende collegate ad almeno una trattativa con commerciale uguale all'email dell'utente oppure a un ticket con assegnatario uguale alla sua email: usa search_records su companies con mine_only=true.
+- "I miei clienti" significa aziende collegate ad almeno una trattativa con commerciale uguale all'email dell'utente oppure a un ticket con assegnatario uguale alla sua email: per mostrarli nell'app usa open_crm_view con view=companies e filters.mine_only=true; per calcoli usa search_records su companies con mine_only=true.
 - Per conteggi e somme usa aggregate. Per un elenco completo usa all_pages; senza all_pages una pagina non prova il totale complessivo.
 - partita_iva deve avere esattamente undici cifre ed essere unica. Spiega i conflitti, senza aggirarli.
 - Per commerciale o assegnatario passa nome completo o email. Sono validi solo utenti attivi; in caso di ambiguità chiedi all'utente.
@@ -530,6 +590,7 @@ async def _handle_agent_inner(body: dict) -> str:
 
     messages = _conversation_messages(body, context)
     mutation_results: dict[str, str] = {}
+    ui_action_request: dict[str, Any] | None = None
     tool_call_count = 0
     try:
         async with asyncio.timeout(55):
@@ -539,7 +600,14 @@ async def _handle_agent_inner(body: dict) -> str:
                     tool_calls = assistant_message.get("tool_calls") or []
                     if not tool_calls:
                         text = str(assistant_message.get("content") or "").strip()
-                        return text or "Non sono riuscito a formulare una risposta completa."
+                        reply = text or (
+                            f"Ho aperto {ui_action_request.get('title') or 'la vista richiesta'}."
+                            if ui_action_request else "Non sono riuscito a formulare una risposta completa."
+                        )
+                        result: dict[str, Any] = {"reply": reply}
+                        if ui_action_request:
+                            result["ui_action_request"] = ui_action_request
+                        return result
                     messages.append(
                         {
                             "role": "assistant",
@@ -560,6 +628,8 @@ async def _handle_agent_inner(body: dict) -> str:
                                 content = mutation_results[signature]
                             else:
                                 result = await _execute_tool(name, arguments, context)
+                                if name == "open_crm_view":
+                                    ui_action_request = result
                                 content = json.dumps({"ok": True, "result": result}, ensure_ascii=False, default=str)
                                 if name in MUTATING_TOOLS:
                                     mutation_results[signature] = content
