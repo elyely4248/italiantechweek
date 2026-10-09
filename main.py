@@ -1887,10 +1887,12 @@ async def ui_records(
 @app.post("/__reset", status_code=204)
 async def reset_crm() -> Response:
     global _rate_limit_count
-    await _call_db("reset_db")
+    migration = importlib.import_module("migration")
     from automations import reset_automation_state
-    await reset_automation_state()
-    _rate_limit_count = 0
+    async with migration.reset_guard():
+        await _call_db("reset_db")
+        await reset_automation_state()
+        _rate_limit_count = 0
     return Response(status_code=204)
 
 
@@ -1903,7 +1905,10 @@ async def migrate_crm(body: dict[str, Any]) -> Response:
         migration = importlib.import_module("migration")
     except ModuleNotFoundError as exc:
         raise api_error(503, "Migration service is not installed", "SERVICE_UNAVAILABLE") from exc
-    await migration.run_migration(export_url)
+    try:
+        await migration.run_migration(export_url)
+    except (migration.MigrationConflictError, migration.MigrationResetError) as exc:
+        raise api_error(409, str(exc), "CONFLICT") from exc
     return Response(status_code=204)
 
 

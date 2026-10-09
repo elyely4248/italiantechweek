@@ -1,7 +1,9 @@
+import asyncio
 import sys
 import types
 import unittest
 from decimal import Decimal
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 import migration
@@ -34,6 +36,86 @@ class MigrationHelpersTests(unittest.TestCase):
 
 
 class MigrationLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.patches = ExitStack()
+        self.addCleanup(self.patches.close)
+        self.patches.enter_context(patch.object(migration, "_operation_lock", asyncio.Lock()))
+        self.patches.enter_context(patch.object(migration, "_migration_task", None))
+        self.patches.enter_context(patch.object(migration, "_migration_url", None))
+
+    async def test_overlapping_migrations_and_retry_import_only_once(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def import_export(url):
+            started.set()
+            await finish.wait()
+
+        with patch.object(migration, "_run_migration", AsyncMock(side_effect=import_export)) as importer:
+            first = asyncio.create_task(migration.run_migration("https://example.test/export.zip"))
+            await started.wait()
+            second = asyncio.create_task(migration.run_migration("https://example.test/export.zip"))
+            await asyncio.sleep(0)
+            finish.set()
+            await asyncio.gather(first, second)
+            await migration.run_migration("https://example.test/export.zip")
+            importer.assert_awaited_once()
+
+    async def test_reset_waits_for_cancelled_import_cleanup_then_allows_new_import(self):
+        started = asyncio.Event()
+        events = []
+
+        async def import_export(url):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                events.append("rolled back")
+
+        with patch.object(migration, "_run_migration", AsyncMock(side_effect=import_export)):
+            first = asyncio.create_task(migration.run_migration("https://example.test/export.zip"))
+            await started.wait()
+            async with migration.reset_guard():
+                events.append("reset")
+            with self.assertRaises(migration.MigrationResetError):
+                await first
+        self.assertEqual(events, ["rolled back", "reset"])
+        with patch.object(migration, "_run_migration", AsyncMock()) as importer:
+            await migration.run_migration("https://example.test/export.zip")
+            importer.assert_awaited_once()
+
+    async def test_failed_import_can_be_retried(self):
+        with patch.object(migration, "_run_migration", AsyncMock(side_effect=[RuntimeError("failed"), None])) as importer:
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                await migration.run_migration("https://example.test/export.zip")
+            await migration.run_migration("https://example.test/export.zip")
+            self.assertEqual(importer.await_count, 2)
+
+    async def test_disconnected_waiter_does_not_cancel_shared_import(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def import_export(url):
+            started.set()
+            await finish.wait()
+
+        with patch.object(migration, "_run_migration", AsyncMock(side_effect=import_export)) as importer:
+            first = asyncio.create_task(migration.run_migration("https://example.test/export.zip"))
+            await started.wait()
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            self.assertFalse(migration._migration_task.done())
+            finish.set()
+            await migration.run_migration("https://example.test/export.zip")
+            importer.assert_awaited_once()
+
+    async def test_different_export_requires_reset(self):
+        with patch.object(migration, "_run_migration", AsyncMock()) as importer:
+            await migration.run_migration("https://example.test/first.zip")
+            with self.assertRaises(migration.MigrationConflictError):
+                await migration.run_migration("https://example.test/second.zip")
+            importer.assert_awaited_once()
+
     async def test_migration_flag_is_reset_when_download_fails(self):
         fake_automations = types.SimpleNamespace(_migration_active=False)
         with patch.dict(sys.modules, {"automations": fake_automations}), patch.object(

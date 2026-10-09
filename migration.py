@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import zipfile
 from collections import defaultdict
+from contextlib import asynccontextmanager, suppress
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
@@ -48,6 +49,17 @@ CSV_NAMES = {
     "storico_fasi.csv",
 }
 CENT = Decimal("0.01")
+_operation_lock = asyncio.Lock()
+_migration_task: asyncio.Task[None] | None = None
+_migration_url: str | None = None
+
+
+class MigrationConflictError(RuntimeError):
+    pass
+
+
+class MigrationResetError(RuntimeError):
+    pass
 
 
 def _db():
@@ -151,8 +163,7 @@ async def _preserve_createdates(values: list[tuple[int, str]]) -> None:
     values = [(object_id, value) for object_id, value in values if value]
     if not values:
         return
-    pool = await _db().get_pool()
-    async with pool.acquire() as conn:
+    async with _db()._connection() as conn:
         await conn.executemany(
             """UPDATE objects
                SET properties = properties || jsonb_build_object('createdate', $2::text),
@@ -242,8 +253,7 @@ async def _create_configuration() -> None:
 
 
 async def _calculate_revenue() -> None:
-    pool = await _db().get_pool()
-    async with pool.acquire() as conn:
+    async with _db()._connection() as conn:
         rows = await conn.fetch(
             """SELECT a.to_object_id AS company_id,
                       COALESCE(SUM(
@@ -277,8 +287,7 @@ async def _calculate_revenue() -> None:
 
 
 async def _create_dormant_list() -> None:
-    pool = await _db().get_pool()
-    async with pool.acquire() as conn:
+    async with _db()._connection() as conn:
         rows = await conn.fetch(
             """WITH won_companies AS (
                  SELECT DISTINCT a.to_object_id AS company_id
@@ -584,7 +593,7 @@ async def _migrate_files(files: dict[str, Path]) -> None:
     await _create_dormant_list()
 
 
-async def run_migration(export_url: str) -> None:
+async def _run_migration(export_url: str) -> None:
     import automations
 
     automations._migration_active = True
@@ -598,9 +607,51 @@ async def run_migration(export_url: str) -> None:
             with zipfile.ZipFile(archive_path) as archive:
                 _safe_extract(archive, extract_path)
             files = _find_csvs(extract_path)
-            await _migrate_files(files)
+            async with _db().migration_transaction():
+                await _migrate_files(files)
     finally:
         automations._migration_active = False
+
+
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def run_migration(export_url: str) -> None:
+    """Coalesce concurrent calls and successful retries until the next reset."""
+    global _migration_task, _migration_url
+    async with _operation_lock:
+        task = _migration_task
+        if task is not None and task.done() and (task.cancelled() or task.exception() is not None):
+            task = None
+        if task is None:
+            task = asyncio.create_task(_run_migration(export_url))
+            task.add_done_callback(_consume_task_exception)
+            _migration_task, _migration_url = task, export_url
+        elif export_url != _migration_url:
+            raise MigrationConflictError("Reset the CRM before migrating a different export")
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if task.cancelled():
+            raise MigrationResetError("Migration cancelled by a CRM reset") from None
+        raise
+
+
+@asynccontextmanager
+async def reset_guard():
+    """Stop the previous import and wait for rollback before clearing the CRM."""
+    global _migration_task, _migration_url
+    async with _operation_lock:
+        task = _migration_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        _migration_task = None
+        _migration_url = None
+        yield
 
 
 __all__ = ["run_migration"]

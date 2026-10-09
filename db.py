@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, AsyncIterator, Iterable, Sequence
@@ -13,6 +14,7 @@ import asyncpg
 
 
 _pool: asyncpg.Pool | None = None
+_transaction_connection: ContextVar[asyncpg.Connection | None] = ContextVar("transaction_connection", default=None)
 
 OBJECT_TYPES = (
     "contacts",
@@ -152,12 +154,26 @@ def _record_to_object(record: asyncpg.Record, properties: Sequence[str] | None =
 
 @asynccontextmanager
 async def _connection(conn: asyncpg.Connection | None = None) -> AsyncIterator[asyncpg.Connection]:
+    if conn is None:
+        conn = _transaction_connection.get()
     if conn is not None:
         yield conn
         return
     pool = await get_pool()
     async with pool.acquire() as acquired:
         yield acquired
+
+
+@asynccontextmanager
+async def migration_transaction() -> AsyncIterator[asyncpg.Connection]:
+    """Keep every migration write in one transaction, including derived data."""
+    async with _connection() as conn:
+        async with conn.transaction():
+            token = _transaction_connection.set(conn)
+            try:
+                yield conn
+            finally:
+                _transaction_connection.reset(token)
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -934,8 +950,7 @@ async def create_pipeline(
     stages: list[dict[str, Any]],
     display_order: int = 0,
 ) -> dict[str, Any]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with _connection() as conn:
         async with conn.transaction():
             await conn.execute(
                 "INSERT INTO pipelines(id,object_type,label,display_order) VALUES($1,$2,$3,$4)",
@@ -1121,8 +1136,7 @@ async def get_property_def(object_type: str, name: str) -> dict[str, Any] | None
 
 
 async def create_property_def(object_type: str, name: str, **kwargs: Any) -> dict[str, Any]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with _connection() as conn, conn.transaction():
         row = await conn.fetchrow(
             """
             INSERT INTO property_definitions
@@ -1200,8 +1214,7 @@ def _list_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 
 
 async def create_list(name: str, object_type: str = "companies", dynamic: bool = False) -> int:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with _connection() as conn:
         list_id = await conn.fetchval(
             "INSERT INTO lists(name,object_type,dynamic) VALUES($1,$2,$3) RETURNING id",
             name,
@@ -1215,8 +1228,7 @@ async def add_to_list(list_id: int, object_ids: Iterable[int]) -> None:
     values = [(int(list_id), int(object_id)) for object_id in object_ids]
     if not values:
         return
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with _connection() as conn:
         async with conn.transaction():
             await conn.executemany(
                 "INSERT INTO list_memberships(list_id,object_id) VALUES($1,$2) ON CONFLICT DO NOTHING",

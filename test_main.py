@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import types
@@ -8,6 +9,7 @@ import httpx
 
 import automations
 import main
+import migration
 
 
 class FakeDB:
@@ -234,6 +236,43 @@ class ApiTests(BaseAsyncTest):
         self.assertEqual(response.status_code, 204)
         self.assertFalse(self.db.claims)
         self.assertEqual(main._rate_limit_count, 0)
+
+    async def test_overlapping_migration_requests_both_return_204(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def import_export(url):
+            started.set()
+            await finish.wait()
+
+        with patch.object(migration, "_run_migration", AsyncMock(side_effect=import_export)) as importer:
+            body = {"export_url": "https://example.test/export.zip"}
+            first = asyncio.create_task(self.client.post("/__migrate", json=body))
+            await started.wait()
+            second = asyncio.create_task(self.client.post("/__migrate", json=body))
+            await asyncio.sleep(0)
+            finish.set()
+            responses = await asyncio.gather(first, second)
+            self.assertEqual([r.status_code for r in responses], [204, 204])
+            importer.assert_awaited_once()
+        async with migration.reset_guard():
+            pass
+
+    async def test_reset_cancels_old_migration_and_returns_204(self):
+        started = asyncio.Event()
+
+        async def import_export(url):
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(migration, "_run_migration", AsyncMock(side_effect=import_export)):
+            importing = asyncio.create_task(self.client.post(
+                "/__migrate", json={"export_url": "https://example.test/export.zip"}))
+            await started.wait()
+            reset = await self.client.post("/__reset")
+            self.assertEqual(reset.status_code, 204)
+            cancelled = await importing
+            self.assertEqual(cancelled.status_code, 409)
+            self.assertIn("cancelled", cancelled.json()["message"])
 
     async def test_contact_company_inference_endpoint_defaults_to_dry_run(self):
         response = await self.client.post("/__infer-contact-company-associations", json={})
