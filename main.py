@@ -11,7 +11,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 
 APP_VERSION = "2026-09"
@@ -20,12 +20,13 @@ OBJECT_TYPE_ALIASES = {
     "ticket": "tickets", "note": "notes", "call": "calls",
     "email": "emails", "meeting": "meetings", "product": "products",
     "line_item": "line_items", "task": "tasks", "quote": "quotes",
+    "user": "users",
 }
 KNOWN_OBJECT_TYPES = {
     "contacts", "companies", "deals", "tickets", "notes", "calls",
-    "emails", "meetings", "products", "line_items", "tasks", "quotes",
+    "emails", "meetings", "products", "line_items", "tasks", "quotes", "users",
 }
-UI_TYPES = ("contacts", "companies", "deals", "tickets", "dormant")
+UI_TYPES = ("smart", "contacts", "companies", "deals", "tickets", "dormant")
 ASSOCIATION_LABEL_TYPES = {
     ("contacts", "companies"): 1,
     ("companies", "contacts"): 2,
@@ -291,6 +292,11 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/contacts", status_code=302)
+
+
 CRM_CSS = """
 :root{--nav:#2e475d;--accent:#ff7a59;--teal:#00a4bd;--bg:#f5f8fa;--line:#dbe4ea;--text:#213343;--muted:#607286;--good:#00a86b;--warn:#f5c542;--bad:#d94c4c}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -327,10 +333,12 @@ body{background:linear-gradient(180deg,#f7fafc 0,#eef4f8 100%);color:var(--ink);
 .topbar-search{position:relative;display:flex;align-items:center;min-width:280px;max-width:430px;width:32vw;margin-left:auto}.topbar-search+.topbar-meta{margin-left:12px}.search-icon{position:absolute;left:12px;color:var(--muted);font-size:14px;pointer-events:none}.topbar-search input{width:100%;height:38px;border:1px solid var(--line);border-radius:999px;background:#fff;padding:0 38px 0 34px;color:var(--text);font-size:13px;outline:none;box-shadow:var(--shadow-sm)}.topbar-search input:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(0,164,189,.12)}.search-clear{position:absolute;right:7px;width:26px;height:26px;border:0;border-radius:50%;background:#eef3f6;color:var(--muted);cursor:pointer}.search-clear:hover{background:#dbe7ee;color:var(--text)}
 th.sortable{cursor:pointer;user-select:none;white-space:nowrap}.sort-indicator{display:inline-block;width:14px;margin-left:5px;color:var(--muted)}th.sort-asc .sort-indicator:after{content:"\\25B2"}th.sort-desc .sort-indicator:after{content:"\\25BC"}.filter-row th{position:sticky;top:38px;z-index:2;background:#fff;padding:8px 10px}.filter-row input,.filter-row select{width:100%;min-width:90px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:7px 8px;color:var(--text);font-size:12px;text-transform:none;letter-spacing:0;outline:none}.filter-row input:focus,.filter-row select:focus{border-color:var(--teal);box-shadow:0 0 0 2px rgba(0,164,189,.1)}
 tbody tr.row-clickable{cursor:pointer}tbody tr.row-clickable:hover{background:#eef8fb}.chat-actions{display:flex;gap:8px;overflow-x:auto;border-bottom:1px solid var(--line);padding:10px;background:#fff}.chat-action{flex:0 0 auto;border:1px solid var(--line);border-radius:999px;background:#f8fbfd;color:#263d50;padding:7px 10px;font-size:12px;font-weight:750;cursor:pointer}.chat-action:hover{border-color:var(--teal);color:#0b6f8a}.chat-msg.assistant strong{font-weight:800}.chat-msg.assistant ol{margin:6px 0 0 20px;padding:0}.chat-msg.assistant li{margin:4px 0}.chat-msg.assistant .crm-link{color:var(--teal);font-weight:800;text-decoration:none}.chat-msg.assistant .crm-link:hover{text-decoration:underline}
+.smart-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin-bottom:16px}.smart-controls label{display:grid;gap:5px;color:var(--muted);font-size:12px;font-weight:750}.smart-controls select{min-width:240px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:9px 10px;color:var(--text);font-size:13px}.smart-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.smart-card{background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow-sm);overflow:hidden}.smart-card-h{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:13px 14px;border-bottom:1px solid var(--line);font-weight:850}.smart-card-b{padding:10px 14px}.smart-item{padding:12px 0;border-bottom:1px solid var(--line)}.smart-item:last-child{border-bottom:0}.smart-score{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:26px;border-radius:999px;background:#e8f5f8;color:#0b6f8a;font-weight:850}.reason-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}@media (max-width:1050px){.smart-grid{grid-template-columns:1fr}}
 @media (max-width:850px){.topbar-search{width:100%;max-width:none;min-width:0;margin:12px 0 0}.topbar-search+.topbar-meta{margin-left:0}.topbar-meta{width:100%}}
 """
 
 NAV_LABELS = {
+    "smart": "Vista intelligente",
     "contacts": "Contatti",
     "companies": "Aziende",
     "deals": "Trattative",
@@ -441,6 +449,165 @@ def _stage_total_label(deals: list[dict[str, Any]]) -> str:
         total = sum(_number(_prop(deal, "amount")) or 0 for deal in deals)
         return _money(total, currency)
     return "multi-valuta"
+
+
+OPEN_DEAL_STAGES = {
+    "appointmentscheduled", "qualifiedtobuy", "presentationscheduled",
+    "decisionmakerboughtin", "contractsent", "in_trattativa", "preventivo",
+    "negoziazione", "proposal", "open",
+}
+WON_DEAL_STAGES = {"closedwon", "rinnovato"}
+LOST_DEAL_STAGES = {"closedlost", "non_rinnovato"}
+CLOSED_TICKET_STAGES = {"chiuso", "closed", "closedwon", "closedlost", "resolved"}
+PRIORITY_SCORE = {"URGENT": 34, "HIGH": 24, "MEDIUM": 12, "LOW": 4}
+
+
+def _parse_day(value: Any):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text[:10]).date()
+    except ValueError:
+        return None
+
+
+def _days_from_today(value: Any) -> int | None:
+    day = _parse_day(value)
+    if day is None:
+        return None
+    return (day - datetime.now(timezone.utc).date()).days
+
+
+def _amount_weight(value: Any) -> tuple[int, str | None]:
+    amount = _number(value) or 0
+    if amount >= 1_000_000:
+        return 30, "valore molto alto"
+    if amount >= 250_000:
+        return 24, "valore alto"
+    if amount >= 50_000:
+        return 16, "valore rilevante"
+    if amount > 0:
+        return 7, "valore presente"
+    return 0, None
+
+
+def _smart_reasons(items: list[str], limit: int = 4) -> str:
+    return "<div class='reason-row'>" + "".join(_badge(item, "blue") for item in items[:limit]) + "</div>" if items else ""
+
+
+def _is_open_deal(deal: dict[str, Any]) -> bool:
+    stage = _prop(deal, "dealstage").lower()
+    return stage not in WON_DEAL_STAGES and stage not in LOST_DEAL_STAGES
+
+
+def _is_open_ticket(ticket: dict[str, Any]) -> bool:
+    return _prop(ticket, "hs_pipeline_stage").lower() not in CLOSED_TICKET_STAGES
+
+
+def _score_deal(deal: dict[str, Any], viewer_email: str = "") -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    owner = _prop(deal, "commerciale").lower()
+    stage = _prop(deal, "dealstage").lower()
+    if viewer_email and owner == viewer_email:
+        score += 35
+        reasons.append("commerciale assegnato")
+    if _is_open_deal(deal):
+        score += 24
+        reasons.append("trattativa aperta")
+    elif stage in WON_DEAL_STAGES:
+        score += 8
+        reasons.append("storico vinto")
+    else:
+        score -= 12
+        reasons.append("chiusa o persa")
+    amount_score, amount_reason = _amount_weight(_prop(deal, "amount"))
+    score += amount_score
+    if amount_reason:
+        reasons.append(amount_reason)
+    days = _days_from_today(_prop(deal, "closedate"))
+    if _is_open_deal(deal):
+        if days is None:
+            score += 4
+            reasons.append("chiusura da definire")
+        elif days < 0:
+            score += 28
+            reasons.append("chiusura scaduta")
+        elif days <= 14:
+            score += 24
+            reasons.append("chiusura vicina")
+        elif days <= 45:
+            score += 14
+            reasons.append("chiusura prossima")
+    updated_days = _days_from_today(_prop(deal, "lastmodifieddate"))
+    if updated_days is not None and updated_days >= -14:
+        score += 5
+        reasons.append("aggiornata di recente")
+    return score, reasons
+
+
+def _score_ticket(ticket: dict[str, Any], viewer_email: str = "") -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    assignee = _prop(ticket, "assegnatario").lower()
+    if viewer_email and assignee == viewer_email:
+        score += 35
+        reasons.append("assegnato a te")
+    if _is_open_ticket(ticket):
+        score += 24
+        reasons.append("ticket aperto")
+    else:
+        score -= 10
+        reasons.append("ticket chiuso")
+    priority = _prop(ticket, "hs_ticket_priority").upper()
+    priority_score = PRIORITY_SCORE.get(priority, 0)
+    score += priority_score
+    if priority_score >= 24:
+        reasons.append("priorita alta")
+    elif priority_score:
+        reasons.append("priorita presente")
+    created = _parse_day(_prop(ticket, "createdate"))
+    if created and _is_open_ticket(ticket):
+        age = (datetime.now(timezone.utc).date() - created).days
+        if age >= 45:
+            score += 18
+            reasons.append("aperto da molto")
+        elif age >= 14:
+            score += 10
+            reasons.append("in attesa")
+    return score, reasons
+
+
+def _score_company(
+    company: dict[str, Any],
+    deal_scores: list[int] | None = None,
+    ticket_scores: list[int] | None = None,
+    viewer_match: bool = False,
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    if viewer_match:
+        score += 28
+        reasons.append("collegata al viewer")
+    customer_class = _prop(company, "classe_cliente").upper()
+    if customer_class == "A":
+        score += 18
+        reasons.append("classe A")
+    elif customer_class == "B":
+        score += 10
+        reasons.append("classe B")
+    amount_score, amount_reason = _amount_weight(_prop(company, "fatturato_2025"))
+    score += min(amount_score, 20)
+    if amount_reason:
+        reasons.append("fatturato rilevante")
+    if deal_scores:
+        score += min(32, max(deal_scores) // 2)
+        reasons.append("trattative rilevanti")
+    if ticket_scores:
+        score += min(26, max(ticket_scores) // 2)
+        reasons.append("ticket da seguire")
+    return score, reasons
 
 
 def _layout(title: str, active: str, body: str, subtitle: str = "") -> str:
@@ -771,6 +938,164 @@ async def _associated_records(object_type: str, object_id: int, target_type: str
 async def _company_name_for(object_type: str, object_id: int) -> str:
     companies = await _associated_records(object_type, object_id, "companies")
     return _prop(companies[0], "name", "-") if companies else "-"
+
+
+async def _active_users() -> list[dict[str, Any]]:
+    return await _all_search_results(
+        "users",
+        [{"filters": [{"propertyName": "active", "operator": "EQ", "value": "true"}]}],
+    )
+
+
+def _user_display(user: dict[str, Any]) -> tuple[str, str]:
+    props = _props(user)
+    email = str(props.get("email", "")).strip().lower()
+    name = " ".join(part for part in (props.get("firstname"), props.get("lastname")) if part).strip()
+    return email, name or email or f"Utente {user.get('id', '')}"
+
+
+def _smart_section(title: str, count: int, items: str) -> str:
+    return (
+        "<section class='smart-card'>"
+        f"<div class='smart-card-h'><span>{_h(title)}</span><span class='badge gray'>{count}</span></div>"
+        f"<div class='smart-card-b'>{items or '<div class=\"empty\">Nessun elemento rilevante.</div>'}</div>"
+        "</section>"
+    )
+
+
+async def _render_smart_page(user: str | None = None) -> str:
+    viewer_email = str(user or "").strip().lower()
+    users = await _active_users()
+    user_options = ["<option value=''>Vista generale</option>"]
+    known_user = not viewer_email
+    for item in users:
+        email, name = _user_display(item)
+        if not email:
+            continue
+        selected = " selected" if email == viewer_email else ""
+        known_user = known_user or email == viewer_email
+        user_options.append(f"<option value='{_h(email)}'{selected}>{_h(name)} ({_h(email)})</option>")
+    if viewer_email and not known_user:
+        user_options.append(f"<option value='{_h(viewer_email)}' selected>{_h(viewer_email)}</option>")
+
+    deals = await _all_search_results("deals", [])
+    tickets = await _all_search_results("tickets", [])
+    scored_deals = sorted(
+        ((score, deal, reasons) for deal in deals for score, reasons in [_score_deal(deal, viewer_email)]),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    scored_tickets = sorted(
+        ((score, ticket, reasons) for ticket in tickets for score, reasons in [_score_ticket(ticket, viewer_email)]),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    company_context: dict[int, dict[str, Any]] = {}
+
+    async def add_company_context(source_type: str, source_id: int, source_score: int, kind: str, viewer_match: bool) -> str:
+        companies = await _associated_records(source_type, source_id, "companies")
+        if not companies:
+            return "-"
+        company = companies[0]
+        company_id = int(company.get("id", 0))
+        entry = company_context.setdefault(
+            company_id,
+            {"company": company, "deal_scores": [], "ticket_scores": [], "viewer_match": False},
+        )
+        entry["viewer_match"] = bool(entry["viewer_match"] or viewer_match)
+        entry[f"{kind}_scores"].append(source_score)
+        return _prop(company, "name", f"Azienda {company_id}")
+
+    deal_items = []
+    for score, deal, reasons in scored_deals[:10]:
+        deal_id = int(deal.get("id", 0))
+        owner_match = bool(viewer_email and _prop(deal, "commerciale").lower() == viewer_email)
+        company_name = await add_company_context("deals", deal_id, score, "deal", owner_match)
+        deal_items.append(
+            "<div class='smart-item'>"
+            f"<div class='toolbar'><div><div class='item-title'>{_h(_prop(deal, 'dealname', 'Trattativa'))}</div>"
+            f"<div class='muted'>{_h(company_name)} &middot; {_h(_prop(deal, 'commerciale', '-'))}</div></div>"
+            f"<span class='smart-score'>{score}</span></div>"
+            f"<div class='deal-meta'>{_stage_badge(_prop(deal, 'dealstage'))}{_badge(_date_short(_prop(deal, 'closedate')), 'gray', 'Chiusura: ' + _date_short(_prop(deal, 'closedate')))}{_badge(_deal_amount(deal), 'green')}</div>"
+            f"{_smart_reasons(reasons)}"
+            "</div>"
+        )
+
+    ticket_items = []
+    for score, ticket, reasons in scored_tickets[:10]:
+        ticket_id = int(ticket.get("id", 0))
+        assignee_match = bool(viewer_email and _prop(ticket, "assegnatario").lower() == viewer_email)
+        company_name = await add_company_context("tickets", ticket_id, score, "ticket", assignee_match)
+        ticket_items.append(
+            "<div class='smart-item'>"
+            f"<div class='toolbar'><div><div class='item-title'>{_h(_prop(ticket, 'subject', 'Ticket'))}</div>"
+            f"<div class='muted'>{_h(company_name)} &middot; {_h(_prop(ticket, 'assegnatario', '-'))}</div></div>"
+            f"<span class='smart-score'>{score}</span></div>"
+            f"<div class='deal-meta'>{_priority_badge(_prop(ticket, 'hs_ticket_priority'))}{_stage_badge(_prop(ticket, 'hs_pipeline_stage'))}{_badge(_date_short(_prop(ticket, 'createdate')), 'gray', 'Creato: ' + _date_short(_prop(ticket, 'createdate')))}</div>"
+            f"{_smart_reasons(reasons)}"
+            "</div>"
+        )
+
+    if not company_context:
+        companies_page = await _call_db("list_objects", "companies", limit=30, after=None)
+        for company in companies_page.get("results", []):
+            company_context[int(company.get("id", 0))] = {
+                "company": company,
+                "deal_scores": [],
+                "ticket_scores": [],
+                "viewer_match": False,
+            }
+
+    scored_companies = []
+    for company_id, entry in company_context.items():
+        score, reasons = _score_company(
+            entry["company"],
+            entry["deal_scores"],
+            entry["ticket_scores"],
+            bool(entry["viewer_match"]),
+        )
+        scored_companies.append((score, company_id, entry["company"], reasons))
+    scored_companies.sort(key=lambda item: item[0], reverse=True)
+    company_items = "".join(
+        "<div class='smart-item'>"
+        f"<div class='toolbar'><div><div class='item-title'><a href='/companies/{company_id}'>{_h(_prop(company, 'name', f'Azienda {company_id}'))}</a></div>"
+        f"<div class='muted'>{_h(_prop(company, 'domain', '-'))} &middot; {_h(_prop(company, 'city', '-'))}</div></div>"
+        f"<span class='smart-score'>{score}</span></div>"
+        f"<div class='deal-meta'>{_class_badge(_prop(company, 'classe_cliente'))}{_badge(_money(_prop(company, 'fatturato_2025')), 'green', 'Fatturato 2025: ' + _money(_prop(company, 'fatturato_2025')))}</div>"
+        f"{_smart_reasons(reasons)}"
+        "</div>"
+        for score, company_id, company, reasons in scored_companies[:10]
+    )
+
+    viewer_label = viewer_email or "vista generale"
+    controls = (
+        "<form class='smart-controls' method='get'>"
+        f"<label>Viewer<select name='user' onchange='this.form.submit()'>{''.join(user_options)}</select></label>"
+        "<button class='btn' type='submit'>Aggiorna vista</button>"
+        "</form>"
+    )
+    stats = (
+        "<div class='stats'>"
+        f"<div class='stat'><div class='k'>Viewer</div><div class='v'>{_h(viewer_label)}</div></div>"
+        f"<div class='stat'><div class='k'>Trattative analizzate</div><div class='v'>{len(deals)}</div></div>"
+        f"<div class='stat'><div class='k'>Ticket analizzati</div><div class='v'>{len(tickets)}</div></div>"
+        "</div>"
+    )
+    grid = (
+        "<div class='smart-grid'>"
+        f"{_smart_section('Trattative da guardare', len(deal_items), ''.join(deal_items))}"
+        f"{_smart_section('Ticket prioritari', len(ticket_items), ''.join(ticket_items))}"
+        f"{_smart_section('Aziende nel radar', len(scored_companies[:10]), company_items)}"
+        "</div>"
+    )
+    body = controls + stats + grid
+    return _layout("Vista intelligente", "smart", body, "Record caricati e ordinati per rilevanza operativa")
+
+
+@app.get("/smart", response_class=HTMLResponse, include_in_schema=False)
+async def ui_smart(user: str | None = None):
+    return HTMLResponse(await _render_smart_page(user))
 
 
 def _stage_maps(pipeline: dict[str, Any] | None) -> tuple[dict[str, str], list[str]]:

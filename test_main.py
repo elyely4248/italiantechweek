@@ -65,6 +65,8 @@ class FakeDB:
         return {"results": [self.result(kind, i) for i in ids]}
 
     async def search_objects(self, kind, filter_groups, **kwargs):
+        if not filter_groups:
+            return await self.list_objects(kind, limit=kwargs.get("limit", 10), after=kwargs.get("after"))
         found = []
         for record_id, props in self.records[kind].items():
             for group in filter_groups:
@@ -133,12 +135,45 @@ class ApiTests(BaseAsyncTest):
         health = await self.client.get("/health", headers={})
         self.assertEqual(health.status_code, 200)
         self.assertEqual(set(health.json()["ui"]), set(main.UI_TYPES))
+        root = await self.client.get("/", follow_redirects=False)
+        self.assertEqual(root.status_code, 302)
+        self.assertEqual(root.headers["location"], "/contacts")
         self.assertEqual(
             (await self.client.get("/healthz", headers={"Authorization": ""})).status_code,
             401,
         )
         for route in health.json()["ui"].values():
             self.assertEqual((await self.client.get(route)).status_code, 200)
+
+    async def test_smart_ui_prioritizes_owned_records(self):
+        await self.db.create_object("users", {
+            "firstname": "Elena", "lastname": "CRM", "email": "elena@example.test", "active": "true",
+        })
+        company = await self.db.create_object("companies", {
+            "name": "ACME Srl", "domain": "acme.test", "city": "Milano",
+            "classe_cliente": "A", "fatturato_2025": "250000",
+        })
+        deal = await self.db.create_object("deals", {
+            "dealname": "Rinnovo ACME", "amount": "350000", "pipeline": "default",
+            "dealstage": "contractsent", "closedate": "2026-10-18",
+            "commerciale": "elena@example.test",
+        })
+        ticket = await self.db.create_object("tickets", {
+            "subject": "Blocco portale", "hs_ticket_priority": "HIGH",
+            "hs_pipeline_stage": "aperto", "createdate": "2026-09-01",
+            "assegnatario": "elena@example.test",
+        })
+        await self.db.create_association("deals", int(deal["id"]), "companies", int(company["id"]))
+        await self.db.create_association("tickets", int(ticket["id"]), "companies", int(company["id"]))
+
+        response = await self.client.get("/smart?user=elena@example.test")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Rinnovo ACME", response.text)
+        self.assertIn("Blocco portale", response.text)
+        self.assertIn("ACME Srl", response.text)
+        self.assertIn("commerciale assegnato", response.text)
+        self.assertIn("assegnato a te", response.text)
 
     async def test_no_configured_token_is_401(self):
         os.environ.pop("CRM_TOKEN")
